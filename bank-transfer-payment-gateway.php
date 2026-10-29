@@ -14,6 +14,7 @@
  * Copyright (c) 2024 RT
  */
 
+
 if (!defined('ABSPATH')) {
 	exit;
 }
@@ -93,10 +94,16 @@ function bank_transfer_cancel_unpaid_order_action($order_id)
 	wp_cache_delete('bank_transfer_payment_link_uuid_' . intval($order_id), $cache_group);
 	wp_cache_delete($cache_key, $cache_group);
 
-	$table_name  = $wpdb->prefix . 'order_payment_link';
-	$safe_table_name = esc_sql($table_name);
-	$sql = "SELECT * FROM {$safe_table_name} WHERE order_id = %d LIMIT 1";
-	$payment_row = $wpdb->get_row($wpdb->prepare($sql, intval($order_id)), ARRAY_A);
+	$table_name = esc_sql($wpdb->prefix . 'order_payment_link');
+	// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+	$payment_row = $wpdb->get_row(
+		$wpdb->prepare(
+			"SELECT * FROM {$table_name} WHERE order_id = %d LIMIT 1",
+			intval($order_id)
+		),
+		ARRAY_A
+	);
+	// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 	$uuid = sanitize_text_field($payment_row['uuid'] ?? '');
 
@@ -157,8 +164,8 @@ function bank_transfer_cancel_unpaid_order_action($order_id)
 		return;
 	}
 
-	$apiPath  = '/api/cancel-order-link';
-	$url      = BANK_TRANSFER_BASE_URL . $apiPath;
+	$api_base = defined('BANK_TRANSFER_API_BASE_URL') ? BANK_TRANSFER_API_BASE_URL : (BANK_TRANSFER_BASE_URL . '/payment-api');
+	$url      = $api_base . '/cancel-order-link';
 	$cleanUrl = esc_url_raw(preg_replace('#(?<!:)//+#', '/', $url));
 
 	$request_payload = [

@@ -62,13 +62,16 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 
 		// BT-33: Prevent order reuse on standard checkout for this gateway if identity changes
 		add_action('woocommerce_before_checkout_process', function() {
+			// phpcs:ignore WordPress.Security.NonceVerification.Missing
 			$payment_method = isset($_POST['payment_method']) ? sanitize_text_field(wp_unslash($_POST['payment_method'])) : '';
 			if ('bank_transfer' === $payment_method) {
 				if (function_exists('WC') && WC()->session) {
 					$awaiting_order_id = WC()->session->get('order_awaiting_payment');
 					if ($awaiting_order_id) {
 						$awaiting_order = wc_get_order($awaiting_order_id);
+						// phpcs:ignore WordPress.Security.NonceVerification.Missing
 						$posted_email   = isset($_POST['billing_email']) ? sanitize_email(wp_unslash($_POST['billing_email'])) : '';
+						// phpcs:ignore WordPress.Security.NonceVerification.Missing
 						$posted_phone   = isset($_POST['billing_phone']) ? sanitize_text_field(wp_unslash($_POST['billing_phone'])) : '';
 						
 						if ($awaiting_order && ($awaiting_order->get_billing_email() !== $posted_email || $awaiting_order->get_billing_phone() !== $posted_phone)) {
@@ -403,6 +406,76 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	}
 
 	/**
+	 * Retrieve merchant credentials associated with an order or active gateway settings.
+	 * Never exposes secret keys in returned order objects or logs.
+	 *
+	 * @param WC_Order|null $order
+	 * @return array
+	 */
+	private function get_order_account_credentials($order = null)
+	{
+		$settings   = get_option('woocommerce_bank_transfer_settings', []);
+		$is_sandbox = isset($settings['sandbox']) && $settings['sandbox'] === 'yes';
+
+		$accounts = get_option('woocommerce_bank_transfer_payment_gateway_accounts', []);
+		if (empty($accounts)) {
+			$accounts = isset($settings['accounts']) ? maybe_unserialize($settings['accounts']) : [];
+		}
+		if (is_string($accounts)) {
+			$accounts = maybe_unserialize($accounts);
+		}
+		if (!is_array($accounts)) {
+			$accounts = [];
+		}
+		if (isset($accounts['live_secret_key']) || isset($accounts['sandbox_secret_key'])) {
+			$accounts = [$accounts];
+		}
+
+		$order_public_key = ($order instanceof WC_Order) ? $order->get_meta('_bank_transfer_public_key') : '';
+
+		// If public key is saved on the order, locate matching account
+		if (!empty($order_public_key) && !empty($accounts)) {
+			foreach ($accounts as $account) {
+				if (!is_array($account)) {
+					continue;
+				}
+				if (!empty($account['sandbox_public_key']) && hash_equals($account['sandbox_public_key'], $order_public_key)) {
+					return [
+						'public_key' => $account['sandbox_public_key'],
+						'secret_key' => $account['sandbox_secret_key'] ?? '',
+						'is_sandbox' => 1,
+					];
+				}
+				if (!empty($account['live_public_key']) && hash_equals($account['live_public_key'], $order_public_key)) {
+					return [
+						'public_key' => $account['live_public_key'],
+						'secret_key' => $account['live_secret_key'] ?? '',
+						'is_sandbox' => 0,
+					];
+				}
+			}
+		}
+
+		// Fallback to first available account
+		if (!empty($accounts)) {
+			$first_account = reset($accounts);
+			if (is_array($first_account)) {
+				return [
+					'public_key' => $is_sandbox ? ($first_account['sandbox_public_key'] ?? '') : ($first_account['live_public_key'] ?? ''),
+					'secret_key' => $is_sandbox ? ($first_account['sandbox_secret_key'] ?? '') : ($first_account['live_secret_key'] ?? ''),
+					'is_sandbox' => $is_sandbox ? 1 : 0,
+				];
+			}
+		}
+
+		return [
+			'public_key' => '',
+			'secret_key' => '',
+			'is_sandbox' => $is_sandbox ? 1 : 0,
+		];
+	}
+
+	/**
 	 * BT-15: Rate limiting helper for public AJAX actions
 	 */
 	public function check_rate_limit($action, $max_requests = 15, $period = 60)
@@ -424,7 +497,15 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 
 	private function get_api_url($endpoint)
 	{
-		return $this->base_url . $endpoint;
+		$endpoint = '/' . ltrim($endpoint, '/');
+		if (strpos($endpoint, '/payment-api/') === 0) {
+			return BANK_TRANSFER_BASE_URL . $endpoint;
+		}
+		if (strpos($endpoint, '/api/') === 0) {
+			$endpoint = substr($endpoint, 4);
+		}
+		$api_base = defined('BANK_TRANSFER_API_BASE_URL') ? BANK_TRANSFER_API_BASE_URL : ($this->base_url . '/payment-api');
+		return $api_base . $endpoint;
 	}
 
 	/**
@@ -479,7 +560,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	 */
 	public function bank_transfer_handle_check_payment_status_request($request)
 	{
-		$this->check_rate_limit('status_check', 20, 60);
+		$this->check_rate_limit('status_check', 30, 60);
 		check_ajax_referer('bank_transfer_payment', 'security');
 
 		// Sanitize and validate the order ID from $_POST
@@ -500,7 +581,9 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	public function bank_transfer_check_payment_status($order_id)
 	{
 		$order = wc_get_order($order_id);
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing
 		$order_key = isset($_POST['order_key'])
+			// phpcs:ignore WordPress.Security.NonceVerification.Missing
 			? sanitize_text_field(wp_unslash($_POST['order_key']))
 			: '';
 		$log_prefix = "[Order #{$order_id}]";
@@ -527,16 +610,22 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		// API CALL
 		// -------------------------
 		$payment_token = $order->get_meta('_bank_transfer_pay_id');
+		$creds         = $this->get_order_account_credentials($order);
+		$public_key    = $creds['public_key'];
+		$secret_key    = $creds['secret_key'];
+		$is_sandbox    = $creds['is_sandbox'];
 
-		$public_key = $order->get_meta('_bank_transfer_public_key');
-		if (empty($public_key)) {
-			$settings = get_option('woocommerce_bank_transfer_settings', []);
-			$accounts = isset($settings['accounts']) ? maybe_unserialize($settings['accounts']) : [];
-			if (!empty($accounts) && is_array($accounts)) {
-				$first_account = reset($accounts);
-				$is_sandbox = ($settings['sandbox'] ?? 'no') === 'yes';
-				$public_key = $is_sandbox ? ($first_account['sandbox_public_key'] ?? '') : ($first_account['live_public_key'] ?? '');
-			}
+		if (empty($public_key) || empty($secret_key)) {
+			Bank_Transfer_Payment_Gateway_Logger::warning(
+				$log_prefix . ' CheckStatus | Missing API credentials for merchant account'
+			);
+
+			wp_send_json_error([
+				'message'      => 'Missing merchant account credentials.',
+				'stop_polling' => true,
+			], 400);
+
+			wp_die();
 		}
 
 		$response = wp_remote_post(
@@ -544,8 +633,11 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			[
 				'method'    => 'POST',
 				'body'      => wp_json_encode([
-					'order_id'      => $order_id,
-					'payment_token' => $payment_token
+					'order_id'       => $order_id,
+					'payment_token'  => $payment_token,
+					'is_sandbox'     => $is_sandbox,
+					'api_public_key' => $public_key,
+					'api_secret'     => $secret_key,
 				]),
 				'headers'   => [
 					'Content-Type'  => 'application/json',
@@ -557,14 +649,55 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		);
 
 		if (is_wp_error($response)) {
-
-			Bank_Transfer_Payment_Gateway_Logger::info(
-				$log_prefix . ' CheckStatus | API error'
+			Bank_Transfer_Payment_Gateway_Logger::warning(
+				$log_prefix . ' CheckStatus | Network error: ' . $response->get_error_message()
 			);
 
 			wp_send_json_error([
-				'message' => 'API connection failed.'
-			]);
+				'message'      => 'API connection failed.',
+				'stop_polling' => false,
+			], 500);
+
+			wp_die();
+		}
+
+		$http_code = (int) wp_remote_retrieve_response_code($response);
+
+		if ($http_code === 401) {
+			Bank_Transfer_Payment_Gateway_Logger::warning(
+				$log_prefix . ' CheckStatus | API authentication error (HTTP 401)'
+			);
+
+			wp_send_json_error([
+				'message'      => 'API authentication failed. Please verify merchant credentials.',
+				'stop_polling' => true,
+			], 401);
+
+			wp_die();
+		}
+
+		if ($http_code === 429) {
+			Bank_Transfer_Payment_Gateway_Logger::warning(
+				$log_prefix . ' CheckStatus | Upstream rate limit reached (HTTP 429)'
+			);
+
+			wp_send_json_error([
+				'message'      => 'Rate limit exceeded. Please wait a moment.',
+				'stop_polling' => false,
+			], 429);
+
+			wp_die();
+		}
+
+		if ($http_code < 200 || $http_code >= 300) {
+			Bank_Transfer_Payment_Gateway_Logger::warning(
+				$log_prefix . " CheckStatus | Upstream returned non-2xx status (HTTP {$http_code})"
+			);
+
+			wp_send_json_error([
+				'message'      => 'Unable to check transaction status at this time.',
+				'stop_polling' => false,
+			], $http_code >= 400 && $http_code < 600 ? $http_code : 500);
 
 			wp_die();
 		}
@@ -575,14 +708,14 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		);
 
 		if (!is_array($response_data)) {
-
-			Bank_Transfer_Payment_Gateway_Logger::info(
+			Bank_Transfer_Payment_Gateway_Logger::warning(
 				$log_prefix . ' CheckStatus | Invalid API response'
 			);
 
 			wp_send_json_error([
-				'message' => 'Invalid API response.'
-			]);
+				'message'      => 'Invalid API response.',
+				'stop_polling' => false,
+			], 500);
 
 			wp_die();
 		}
@@ -592,11 +725,11 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			?? $response_data['payment_status']
 			?? null;
 
+			
 		// -------------------------
 		// ENGINE CALL
 		// -------------------------
 		if ($payment_status) {
-
 			Bank_Transfer_Payment_Gateway_Logger::info(
 				$log_prefix . " CheckStatus | Engine trigger ({$payment_status})"
 			);
@@ -611,7 +744,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			);
 
 			Bank_Transfer_Payment_Gateway_Logger::info(
-				$log_prefix . " CheckStatus | Engine result: " . json_encode($result)
+				$log_prefix . " CheckStatus | Engine result: " . wp_json_encode($result)
 			);
 		}
 
@@ -640,11 +773,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		$redirect = null;
 
 		if ($order->has_status(['processing', 'completed'])) {
-
 			$redirect = $order->get_checkout_order_received_url();
-
 		} elseif (in_array($state, ['failed', 'cancelled'], true)) {
-
 			$redirect = wc_get_checkout_url();
 		}
 
@@ -675,7 +805,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 
 	public function handle_popup_close()
 	{
-		$this->check_rate_limit('popup_close', 20, 60);
+		check_ajax_referer('bank_transfer_payment', 'security');
+		$this->check_rate_limit('popup_close', 30, 60);
 
 		$order_id = isset($_POST['order_id'])
 			? intval(sanitize_text_field(wp_unslash($_POST['order_id'])))
@@ -683,10 +814,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 
 		$order_key = isset($_POST['order_key'])
 			? sanitize_text_field(wp_unslash($_POST['order_key']))
-			: '';
-
-		$security = isset($_POST['security'])
-			? sanitize_text_field(wp_unslash($_POST['security']))
 			: '';
 
 		$log_prefix = "[Order #{$order_id}]";
@@ -719,16 +846,23 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		// API CALL
 		// -------------------------
 		$payment_token = $order->get_meta('_bank_transfer_pay_id');
+		$creds         = $this->get_order_account_credentials($order);
+		$public_key    = $creds['public_key'];
+		$secret_key    = $creds['secret_key'];
+		$is_sandbox    = $creds['is_sandbox'];
 
-		$public_key = $order->get_meta('_bank_transfer_public_key');
-		if (empty($public_key)) {
-			$settings = get_option('woocommerce_bank_transfer_settings', []);
-			$accounts = isset($settings['accounts']) ? maybe_unserialize($settings['accounts']) : [];
-			if (!empty($accounts) && is_array($accounts)) {
-				$first_account = reset($accounts);
-				$is_sandbox = ($settings['sandbox'] ?? 'no') === 'yes';
-				$public_key = $is_sandbox ? ($first_account['sandbox_public_key'] ?? '') : ($first_account['live_public_key'] ?? '');
-			}
+		if (empty($public_key) || empty($secret_key)) {
+			Bank_Transfer_Payment_Gateway_Logger::warning(
+				$log_prefix . ' PopupClose | Missing API credentials for merchant account'
+			);
+
+			wp_send_json_error([
+				'reload'       => false,
+				'stop_polling' => true,
+				'message'      => 'Missing merchant account credentials.',
+			], 400);
+
+			wp_die();
 		}
 
 		$response = wp_remote_post(
@@ -736,8 +870,11 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			[
 				'method'    => 'POST',
 				'body'      => wp_json_encode([
-					'order_id'      => $order_id,
-					'payment_token' => $payment_token
+					'order_id'       => $order_id,
+					'payment_token'  => $payment_token,
+					'is_sandbox'     => $is_sandbox,
+					'api_public_key' => $public_key,
+					'api_secret'     => $secret_key,
 				]),
 				'headers'   => [
 					'Content-Type'  => 'application/json',
@@ -749,14 +886,59 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		);
 
 		if (is_wp_error($response)) {
-
-			Bank_Transfer_Payment_Gateway_Logger::info(
-				$log_prefix . ' PopupClose | API error'
+			Bank_Transfer_Payment_Gateway_Logger::warning(
+				$log_prefix . ' PopupClose | Network error: ' . $response->get_error_message()
 			);
 
 			wp_send_json_error([
-				'reload' => true
-			]);
+				'reload'       => false,
+				'stop_polling' => false,
+				'message'      => 'API connection failed.',
+			], 500);
+
+			wp_die();
+		}
+
+		$http_code = (int) wp_remote_retrieve_response_code($response);
+
+		if ($http_code === 401) {
+			Bank_Transfer_Payment_Gateway_Logger::warning(
+				$log_prefix . ' PopupClose | API authentication error (HTTP 401)'
+			);
+
+			wp_send_json_error([
+				'reload'       => false,
+				'stop_polling' => true,
+				'message'      => 'Payment authentication error. Please verify merchant credentials.',
+			], 401);
+
+			wp_die();
+		}
+
+		if ($http_code === 429) {
+			Bank_Transfer_Payment_Gateway_Logger::warning(
+				$log_prefix . ' PopupClose | Upstream rate limit reached (HTTP 429)'
+			);
+
+			wp_send_json_error([
+				'reload'       => false,
+				'stop_polling' => false,
+				'message'      => 'Rate limit exceeded. Please wait a moment.',
+			], 429);
+
+			wp_die();
+		}
+
+		if ($http_code < 200 || $http_code >= 300) {
+			Bank_Transfer_Payment_Gateway_Logger::warning(
+				$log_prefix . " PopupClose | Upstream returned non-2xx status (HTTP {$http_code})"
+			);
+
+			wp_send_json_error([
+				'reload'       => false,
+				'stop_polling' => false,
+				'message'      => 'Unable to verify payment status at this time.',
+			], $http_code >= 400 && $http_code < 600 ? $http_code : 500);
 
 			wp_die();
 		}
@@ -767,36 +949,38 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		);
 
 		if (!is_array($response_data)) {
-
-			Bank_Transfer_Payment_Gateway_Logger::info(
+			Bank_Transfer_Payment_Gateway_Logger::warning(
 				$log_prefix . ' PopupClose | Invalid API response'
 			);
 
 			wp_send_json_error([
-				'reload' => true
-			]);
+				'reload'       => false,
+				'stop_polling' => false,
+				'message'      => 'Invalid API response.',
+			], 500);
 
 			wp_die();
 		}
 
 		$payment_status =
-			$response_data['payment_status']
-			?? $response_data['transaction_status']
+			$response_data['transaction_status']
+			?? $response_data['payment_status']
 			?? null;
 
 		// -------------------------
 		// NO STATUS
 		// -------------------------
 		if (!$payment_status) {
-
 			wp_send_json([
 				'success' => false,
-				'message' => 'Payment was not completed.',
+				'message' => 'Payment status is currently unavailable.',
 				'data' => [
-					'payment_status' => 'abandoned',
+					'payment_status' => 'pending',
 					'order_status'   => $order->get_status(),
-					'state'          => 'abandoned',
+					'state'          => 'pending',
 					'redirect'       => null,
+					'order_id'       => $order_id,
+					'stop_polling'   => false,
 				]
 			]);
 
@@ -815,10 +999,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			]
 		);
 
-		// ❌ REMOVE locked_skip handling completely
-
 		Bank_Transfer_Payment_Gateway_Logger::info(
-			$log_prefix . " PopupClose | Engine result: " . json_encode($result)
+			$log_prefix . " PopupClose | Engine result: " . wp_json_encode($result)
 		);
 
 		// -------------------------
@@ -827,12 +1009,12 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		$order = wc_get_order($order_id);
 
 		// 🔥 PRIMARY STATE = ENGINE STORED STATE ONLY
-		$state = BANK_TRANSFER_PAYMENT_ENGINE::resolve_final_state($order);
+		$state = BANK_TRANSFER_PAYMENT_ENGINE::resolve_final_state($order, $payment_status);
 
 		// -------------------------
 		// HARD OVERRIDE SAFETY (ONLY ONE SOURCE)
 		// -------------------------
-		if ($order->get_meta('_bank_transfer_state') === 'success') {
+		if ($order->get_meta('_bank_transfer_state') === 'success' || $order->has_status(['processing', 'completed'])) {
 			$state = 'success';
 		}
 
@@ -845,7 +1027,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		// MESSAGE
 		// -------------------------
 		$message = match ($state) {
-
 			'success' =>
 				'Your payment was completed successfully.',
 
@@ -869,17 +1050,14 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 
 		// 🔥 ONLY ENGINE STATE DECIDES REDIRECT
 		if ($state === 'success') {
-
 			$redirect = $order->get_checkout_order_received_url();
-
 		} elseif (in_array($state, ['failed', 'cancelled', 'expired'], true)) {
-
 			$redirect = wc_get_checkout_url();
-
 		} else {
-
 			$redirect = null; // processing → no redirect
 		}
+
+		$stop_polling = in_array($state, ['success', 'failed', 'cancelled', 'expired'], true);
 
 		// -------------------------
 		// RESPONSE
@@ -893,6 +1071,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 				'state'          => $state,
 				'redirect'       => $redirect,
 				'order_id'       => $order_id,
+				'stop_polling'   => $stop_polling,
 			]
 		]);
 
@@ -953,11 +1132,12 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		foreach ($accounts as &$account) {
 			$isSandboxEnabled = isset($account['has_sandbox']) && $account['has_sandbox'] === 'on';
 
-			// Prepare both live and sandbox entries without sending secret keys
+			// Prepare both live and sandbox entries
 			if (!empty($account['live_public_key'])) {
 				$accountsData[] = [
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['live_public_key'],
+					'secret_key'   => $account['live_secret_key'] ?? '',
 					'mode'         => 'live',
 				];
 				if (empty($first_public_key)) {
@@ -969,6 +1149,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 				$accountsData[] = [
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['sandbox_public_key'],
+					'secret_key'   => $account['sandbox_secret_key'] ?? '',
 					'mode'         => 'sandbox',
 				];
 				if (empty($first_public_key)) {
@@ -982,19 +1163,33 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			return [];
 		}
 
-		$url = esc_url($this->base_url . '/api/sync-account-status');
+		$url = esc_url($this->get_api_url('/sync-account-status'));
 		$response = wp_remote_post($url, [
 			'headers' => [
 				'Content-Type'  => 'application/json',
 				'Authorization' => 'Bearer ' . sanitize_text_field($first_public_key),
 			],
-			'body'      => json_encode(['accounts' => $accountsData]),
+			'body'      => wp_json_encode(['accounts' => $accountsData]),
 			'timeout'   => 15,
 			'sslverify' => true,
 		]);
 
 		if (is_wp_error($response)) {
 			Bank_Transfer_Payment_Gateway_Logger::error('Unable to connect to the sync service. Please check the server connection or endpoint.', $logger_context);
+			return [];
+		}
+
+		$response_code = wp_remote_retrieve_response_code($response);
+		if ($response_code < 200 || $response_code >= 300) {
+			Bank_Transfer_Payment_Gateway_Logger::warning(
+				'Sync API returned a non-2xx HTTP status. Sync aborted.',
+				array_merge($logger_context, [
+					'context' => [
+						'http_status' => $response_code,
+						'url'         => $url,
+					],
+				])
+			);
 			return [];
 		}
 
@@ -1173,7 +1368,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		];
 
 		$response = wp_remote_post(
-			trailingslashit(BANK_TRANSFER_BASE_URL) . 'api/plugin/check/plugin',
+			$this->get_api_url('/plugin/check/plugin'),
 			[
 				'method'    => 'POST',
 				'timeout'   => 30,

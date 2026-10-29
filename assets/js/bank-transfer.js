@@ -572,7 +572,7 @@
 
             let redirected = false;
             let pollAttempts = 0;
-            const maxAttempts = 120; // 3 minutes maximum polling (120 * 1.5s)
+            const maxAttempts = 60; // 3 minutes maximum polling (60 * 3s)
 
             clearInterval(self.state.popupInterval);
 
@@ -615,7 +615,8 @@
                         // Stop polling if server explicitly indicates stop_polling (e.g. fatal auth / order not found)
                         if (response?.data?.stop_polling || response?.stop_polling) {
                             clearInterval(self.state.popupInterval);
-                            if (!popupExists) {
+                            const finalState = response?.data?.state || response?.state;
+                            if (!popupExists || finalState === 'failed' || finalState === 'cancelled') {
                                 redirected = true;
                                 self.cleanupPopup();
                                 self.showCheckoutError(
@@ -689,12 +690,12 @@
                     'json'
                 ).fail(function (xhr, status, error) {
                     // Stop polling if forbidden or bad request
-                    if (xhr.status === 403 || xhr.status === 400) {
+                    if (xhr.status === 403 || xhr.status === 400 || xhr.status === 401 || xhr.status === 429) {
                         clearInterval(self.state.popupInterval);
                     }
                 });
 
-            }, 1500);
+            }, 3000);
         },
 
         /* =========================================================

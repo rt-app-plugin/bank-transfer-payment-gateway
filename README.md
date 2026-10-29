@@ -7,7 +7,7 @@ The Bank Transfer Payment Gateway plugin for WooCommerce allows you to accept se
 **Contributors:** RT  
 **Tags:** woocommerce, payment gateway, fiat, bank transfer  
 **Requires at least:** 6.2  
-**Tested up to:** 6.7  
+**Tested up to:** 7.1  
 **Stable tag:** 0.1.0  
 **License:** GPLv3 or later  
 **License URI:** [GPLv3 License](https://www.gnu.org/licenses/gpl-3.0.html)  

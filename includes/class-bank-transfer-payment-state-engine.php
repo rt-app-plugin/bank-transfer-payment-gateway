@@ -6,6 +6,7 @@ class BANK_TRANSFER_PAYMENT_ENGINE
     const LOCK_TTL  = 12;
     const EVENT_TTL = 86400;
 
+    
     /* =========================================================
      * ENTRY POINT
      * ========================================================= */
@@ -29,6 +30,7 @@ class BANK_TRANSFER_PAYMENT_ENGINE
 
         global $wpdb;
         $lock_name = "bank_transfer_lock_{$order_id}";
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
         $lock_acquired = (int) $wpdb->get_var($wpdb->prepare("SELECT GET_LOCK(%s, 5)", $lock_name));
         if ($lock_acquired !== 1) {
             return self::safe_response($order, 'locked_skip');
@@ -98,6 +100,7 @@ class BANK_TRANSFER_PAYMENT_ENGINE
             return self::safe_response($order, 'updated', $new_state);
 
         } finally {
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
             $wpdb->query($wpdb->prepare("SELECT RELEASE_LOCK(%s)", $lock_name));
         }
     }
