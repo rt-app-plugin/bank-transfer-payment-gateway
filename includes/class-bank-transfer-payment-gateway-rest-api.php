@@ -74,12 +74,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 		$is_sandbox = isset($settings['sandbox']) && $settings['sandbox'] === 'yes';
 
 		$accounts_data = get_option('woocommerce_bank_transfer_payment_gateway_accounts', []);
-		if (empty($accounts_data)) {
-			$accounts_data = get_option('woocommerce_bytenft_payment_gateway_accounts', []);
-			if (empty($accounts_data)) {
-				$accounts_data = get_option('woocommerce_unified_payment_gateway_accounts', []);
-			}
-		}
 		if (is_string($accounts_data)) {
 			$accounts_data = maybe_unserialize($accounts_data);
 		}

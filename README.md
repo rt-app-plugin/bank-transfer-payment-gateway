@@ -4,37 +4,37 @@ The Bank Transfer Payment Gateway plugin for WooCommerce allows you to accept se
 
 ## Plugin Information
 
-**Contributors:** RT  
+**Contributors:** RT.app  
 **Tags:** woocommerce, payment gateway, fiat, bank transfer  
 **Requires at least:** 6.2  
-**Tested up to:** 6.7  
-**Stable tag:** 0.1.0  
+**Tested up to:** 7.1  
+**Stable tag:** 1.0.0  
 **License:** GPLv3 or later  
 **License URI:** [GPLv3 License](https://www.gnu.org/licenses/gpl-3.0.html)  
 
 ## External Services
 
-This plugin connects to external APIs hosted by RT Payment Gateway (`https://qa.rt.app`) to authenticate merchants, verify transaction limits, create secure payment sessions, and sync payment statuses.
+This plugin connects to external APIs hosted by RT.app Payment Gateway (`https://pay.rt.app`) to authenticate merchants, verify transaction limits, create secure payment sessions, and sync payment statuses.
 
 ### Endpoints Used:
-* `https://qa.rt.app/api/plugin/check/plugin` - Validates plugin installation and retrieves status. Sends site URL and account public keys.
-* `https://qa.rt.app/api/sync-account-status` - Synchronizes merchant account active statuses on a scheduled cron. Sends account public keys and mode.
-* `https://qa.rt.app/api/dailylimit` - Checks daily transaction limits for eligible accounts during checkout. Sends account public key and order amount.
-* `https://qa.rt.app/api/request-payment` - Creates an external payment session link for customer checkout. Sends order amount, currency, order UUID, and masked customer details.
-* `https://qa.rt.app/api/cancel-order-link` - Cancels an active payment session when an order is cancelled. Sends order ID and UUID with HMAC signature.
-* `https://qa.rt.app/api/update-txn-status` - Checks status of an in-progress transaction when customer completes or closes checkout popup.
+* `https://pay.rt.app/payment-api/plugin/check/plugin` - Validates plugin installation and retrieves status. Sends site URL and account public keys.
+* `https://pay.rt.app/payment-api/sync-account-status` - Synchronizes merchant account active statuses on a scheduled cron. Sends account public keys and mode.
+* `https://pay.rt.app/payment-api/dailylimit` - Checks daily transaction limits for eligible accounts during checkout. Sends account public key and order amount.
+* `https://pay.rt.app/payment-api/request-payment` - Creates an external payment session link for customer checkout. Sends order amount, currency, order UUID, and masked customer details.
+* `https://pay.rt.app/payment-api/cancel-order-link` - Cancels an active payment session when an order is cancelled. Sends order ID and UUID with HMAC signature.
+* `https://pay.rt.app/payment-api/update-txn-status` - Checks status of an in-progress transaction when customer completes or closes checkout popup.
 
 ### Policies:
-* [Terms of Service](https://qa.rt.app/terms)
-* [Privacy Policy](https://qa.rt.app/privacy)
+* [Terms of Service](https://pay.rt.app/terms)
+* [Privacy Policy](https://pay.rt.app/privacy)
 
 ## Support
 
-For any issues or enhancement requests with this plugin, please contact the ByteNFT support team. Ensure you provide your plugin, WooCommerce, and WordPress version where applicable to expedite troubleshooting.
+For any issues or enhancement requests with this plugin, please contact the RT.app support team. Ensure you provide your plugin, WooCommerce, and WordPress version where applicable to expedite troubleshooting.
 
 ## Getting Started
 
-1. Obtain your API keys from your ByteNFT dashboard in your Developer Settings - API Keys.
+1. Obtain your API keys from your RT.app dashboard in your Developer Settings - API Keys.
 2. Follow the plugin installation instructions below.
 3. You are ready to take payments in your WooCommerce store!
 
@@ -49,7 +49,7 @@ For any issues or enhancement requests with this plugin, please contact the Byte
 
 ## 1. Download Plugin from GitHub
 
-- Visit the GitHub repository for the ByteNFT Payment Gateway plugin at [GitHub Repository URL](https://github.com/bytenft/bytenft-payment-gateway).
+- Visit the GitHub repository for the Bank Transfer Payment Gateway plugin at [GitHub Repository URL](https://github.com/rt-app/bank-transfer-payment-gateway).
 - Download the plugin ZIP file to your local machine.
 
 ## 2. Install the Plugin in WordPress
@@ -68,20 +68,20 @@ For any issues or enhancement requests with this plugin, please contact the Byte
   Log in to your WordPress Admin Dashboard.
 - **Navigate to Installed Plugins:**
   Go to `Plugins` > `Installed Plugins`.
-- **Activate ByteNFT Payment Gateway:**
-  - Locate the ByteNFT Payment Gateway plugin in the list.
+- **Activate Bank Transfer Payment Gateway:**
+  - Locate the Bank Transfer Payment Gateway plugin in the list.
   - Click `Activate` to enable the plugin.
 
-## 4. Obtain API Keys from ByteNFT Developer Settings Dashboard
+## 4. Obtain API Keys from RT.app Developer Settings Dashboard
 
-- **Log in to ByteNFT Account:**
-  Visit the ByteNFT website and log in to your account.
+- **Log in to RT.app Account:**
+  Visit the RT.app website and log in to your account.
 - **Navigate to Developer Settings to get API Keys:**
   Once logged in, find and access the Developer Settings.
 - **Generate or Retrieve API Keys:**
   If API keys are not already generated, you can create new ones.
   Locate the API Keys or Credentials section.
-  Generate or retrieve the required API keys (e.g., Public Key, Secret Key) needed for integration with the ByteNFT Payment Gateway plugin.
+  Generate or retrieve the required API keys (e.g., Public Key, Secret Key) needed for integration with the Bank Transfer Payment Gateway plugin.
 
 ## 5. Update API Keys in WooCommerce Settings
 
@@ -90,14 +90,14 @@ For any issues or enhancement requests with this plugin, please contact the Byte
   Go to `WooCommerce` > `Settings`.
 - **Access the Payments Tab:**
   Click on the `Payments` tab at the top of the settings page.
-- **Select ByteNFT Payment Gateway:**
-  Scroll down to find and select the ByteNFT Payment Gateway among the available payment methods.
+- **Select Bank Transfer Payment Gateway:**
+  Scroll down to find and select the Bank Transfer Payment Gateway among the available payment methods.
 
 - **Add Plugin General Details:**
 
-  - **Title** : ByteNFT Payment Gateway
+  - **Title** : Bank Transfer Payment Gateway
     Description
-  - **Description** : Secure payments with ByteNFT Payment Gateway.
+  - **Description** : Secure payments with Bank Transfer Payment Gateway.
   - **Enable/Disable Sandbox Mode** : Toggle sandbox mode per account.
   - **Payment Accounts (Add Multiple Accounts)** :
     - **Adding a New Account**
@@ -114,7 +114,7 @@ For any issues or enhancement requests with this plugin, please contact the Byte
 - **Save Changes:**
   Click `Save changes` at the bottom of the page to update and save your API key settings.
 
-## 6. Place Order via ByteNFT Payment Option
+## 6. Place Order via Bank Transfer Payment Option
 
 - **Visit Your Store Page and Add Products to Cart:**
   Navigate to your WordPress site's store page.
@@ -124,15 +124,15 @@ For any issues or enhancement requests with this plugin, please contact the Byte
   Go to your WordPress site's checkout page to review your order details.
 
 - **Check Available Payment Methods:**
-  Ensure that the ByteNFT Payment Gateway option is visible among the available payment methods listed on the checkout page.
+  Ensure that the Bank Transfer Payment Gateway option is visible among the available payment methods listed on the checkout page.
 
 - **Verify Integration:**
-  Confirm that customers can select the ByteNFT Payment Gateway as a payment option when placing their orders.
+  Confirm that customers can select the Bank Transfer Payment Gateway as a payment option when placing their orders.
 
 ## 7. Popup Window for Payment
 
 - **Secure Payment Processing:**
-  Upon selecting ByteNFT, a secure popup window will open for payment processing.
+  Upon selecting Bank Transfer, a secure popup window will open for payment processing.
 
 ## 8. Complete the Payment Process
 
@@ -150,17 +150,21 @@ For any issues or enhancement requests with this plugin, please contact the Byte
 - **Verify Order Status:**
   Log in to your WordPress Admin Dashboard.
   Navigate to `WooCommerce` > `Orders` to view all orders.
-  Check for the latest orders placed using the ByteNFT Payment Gateway to verify their status.
+  Check for the latest orders placed using the Bank Transfer Payment Gateway to verify their status.
 
 ## Documentation
 
-The official documentation for this plugin is available at: [https://qa.rt.app/docs/wordpress-plugin](https://qa.rt.app/docs/wordpress-plugin)
+The official documentation for this plugin is available at: [https://pay.rt.app/docs/wordpress-plugin](https://pay.rt.app/docs/wordpress-plugin)
 
 ## Changelog
 
-### Version 0.1.0
+### Version 1.0.0
 
-- Security enhancements, order verification hardening, rate limiting, and HPOS compatibility.
+- Hardened payment API integration: stopped sending merchant secret keys across remote API calls.
+- Restored account selection and error handling in checkout.
+- Optimized rate limiting and polling backoff for checkout status checks.
+- Isolated plugin options from other gateway plugins.
+- Updated API endpoints and documentation links to production host.
 
 ### Version 1.1.21
 
@@ -183,7 +187,7 @@ The official documentation for this plugin is available at: [https://qa.rt.app/d
 - Fixed an issue where the payment gateway remained visible when no eligible merchant account was available by automatically hiding the plugin.
 
 ### Version 1.0.17
-- Enables merchants to track sales separately for individual ByteNFT accounts.
+- Enables merchants to track sales separately for individual payment accounts.
 - Fix FunnelKit Compatibility Issue Causing Shipping Address Override
 
 ### Version 1.0.16
@@ -252,12 +256,12 @@ The official documentation for this plugin is available at: [https://qa.rt.app/d
 
 ### Version 1.0.0 (Initial Release)
 
-- **Initial Release:** Launched the ByteNFT Payment Gateway plugin with core payment integration functionality for WooCommerce.
+- **Initial Release:** Launched the Bank Transfer Payment Gateway plugin with core payment integration functionality for WooCommerce.
 
 ## Support
 
-For customer support, visit: [https://qa.rt.app/contact-us](https://qa.rt.app/contact-us)
+For customer support, visit: [https://pay.rt.app/contact-us](https://pay.rt.app/contact-us)
 
-## Why Choose ByteNFT Payment Gateway?
+## Why Choose Bank Transfer Payment Gateway?
 
-With the ByteNFT Payment Gateway, you can easily transfer fiat payments to sell products. Choose ByteNFT Payment Gateway as your WooCommerce payment gateway to access your funds quickly through a powerful and secure payment engine provided by ByteNFT.
+With the Bank Transfer Payment Gateway, you can easily transfer fiat payments to sell products. Choose Bank Transfer Payment Gateway as your WooCommerce payment gateway to access your funds quickly through a powerful and secure payment engine provided by RT.app.
