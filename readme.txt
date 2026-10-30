@@ -1,10 +1,10 @@
 === Bank Transfer Payment Gateway ===
-Contributors: RT
+Contributors: RT.app
 Tags: woocommerce, payment gateway, fiat, bank transfer
 Requires at least: 6.2
 Tested up to: 7.1
 Requires PHP: 8.0
-Stable tag: 0.1.0
+Stable tag: 1.0.0
 License: GPLv3 or later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -16,19 +16,19 @@ This plugin integrates Bank Transfer Payment Gateway with WooCommerce, enabling 
 
 == External Services ==
 
-This plugin connects to external APIs hosted by RT Payment Gateway (https://qa.rt.app) to authenticate merchants, verify transaction limits, create secure payment sessions, and sync payment statuses.
+This plugin connects to external APIs hosted by RT.app Payment Gateway (https://pay.rt.app) to authenticate merchants, verify transaction limits, create secure payment sessions, and sync payment statuses.
 
 Endpoints used:
-* `https://qa.rt.app/api/plugin/check/plugin` - Validates the plugin installation and retrieves status. Sends site URL and account public keys.
-* `https://qa.rt.app/api/sync-account-status` - Synchronizes merchant account active statuses on a scheduled cron. Sends account public keys and mode.
-* `https://qa.rt.app/api/dailylimit` - Checks daily transaction limits for eligible accounts during checkout. Sends account public key and order amount.
-* `https://qa.rt.app/api/request-payment` - Creates an external payment session link for customer checkout. Sends order amount, currency, order UUID, and masked customer details.
-* `https://qa.rt.app/api/cancel-order-link` - Cancels an active payment session when an order is cancelled. Sends order ID and UUID with HMAC signature.
-* `https://qa.rt.app/api/update-txn-status` - Checks status of an in-progress transaction when customer completes or closes the checkout popup.
+* `https://pay.rt.app/payment-api/plugin/check/plugin` - Validates the plugin installation and retrieves status. Sends site URL and account public keys.
+* `https://pay.rt.app/payment-api/sync-account-status` - Synchronizes merchant account active statuses on a scheduled cron. Sends account public keys and mode.
+* `https://pay.rt.app/payment-api/dailylimit` - Checks daily transaction limits for eligible accounts during checkout. Sends account public key and order amount.
+* `https://pay.rt.app/payment-api/request-payment` - Creates an external payment session link for customer checkout. Sends order amount, currency, order UUID, and masked customer details.
+* `https://pay.rt.app/payment-api/cancel-order-link` - Cancels an active payment session when an order is cancelled. Sends order ID and UUID with HMAC signature.
+* `https://pay.rt.app/payment-api/update-txn-status` - Checks status of an in-progress transaction when customer completes or closes the checkout popup.
 
 Privacy Policy & Terms:
-* Terms of Service: https://qa.rt.app/terms
-* Privacy Policy: https://qa.rt.app/privacy
+* Terms of Service: https://pay.rt.app/terms
+* Privacy Policy: https://pay.rt.app/privacy
 
 == Installation ==
 
@@ -44,10 +44,14 @@ Visit the payment provider portal and log in to your account. Navigate to Develo
 
 == Changelog ==
 
-= 0.1.0 =
-* Security enhancements, order verification hardening, rate limiting, and HPOS compatibility.
+= 1.0.0 =
+* Hardened payment API integration: stopped sending merchant secret keys across remote API calls.
+* Restored account selection and error handling in checkout.
+* Optimized rate limiting and polling backoff for checkout status checks.
+* Isolated plugin options from other gateway plugins.
+* Updated API endpoints and documentation links to production host.
 
-= 1.0.21 =
+= 1.1.21 =
 * Updated the checkout flow to open the payment link directly without requiring the customer confirmation popup.
 * Improved payment link opening and checkout stability across browsers.
 * Fixed invalid order issues during the checkout and payment flow.
@@ -68,7 +72,7 @@ Visit the payment provider portal and log in to your account. Navigate to Develo
 * Fixed an issue where the payment gateway remained visible when no eligible merchant account was available by automatically hiding the gateway.
 
 = 1.0.17 =
-* Enables merchants using multiple ByteNFT accounts to track sales separately.
+* Enables merchants using multiple payment accounts to track sales separately.
 * Fix FunnelKit Compatibility Issue Causing Shipping Address Override
 
 = 1.0.16 =
@@ -100,10 +104,10 @@ Visit the payment provider portal and log in to your account. Navigate to Develo
 * Update: Removed transaction limit check logic so the plugin remains available regardless of transaction limits.
 
 = 1.0.9 =
-* Blank Page Fix: Resolved a white screen issue caused by improper initialization and unexpected output.
+* Fixed a blank page (white screen) issue that could occur due to unexpected output or initialization conflicts. Update recommended for improved stability.
 
 = 1.0.8 =
-* Fatal Error Fix: Wrapped wc_clear_notices() with function existence checks to prevent PHP fatal errors when WooCommerce is not loaded.
+* Fixed a PHP fatal error caused by wc_clear_notices() in non-checkout or admin pages.
 
 = 1.0.7 =
 * Removed country-based phone number restrictions to support international customers.
@@ -133,12 +137,15 @@ Visit the payment provider portal and log in to your account. Navigate to Develo
 * Adjusted the default plugin title for improved clarity.
 * Resolved an issue where payment links were not functioning correctly on iOS devices.
 
-= 1.0.0 =
+= 1.0.0 (Initial Release) =
 * Initial release.
 
 == Upgrade Notice ==
 
-= 1.0.21 =
+= 1.0.0 =
+* Critical security and stability update. Recommended update for all merchants.
+
+= 1.1.21 =
 * Updated the checkout and payment flow for improved stability.
 * Fixed invalid order issues and popup blocker issues.
 * Improved handling of existing customer phone numbers and DOB.
@@ -155,7 +162,7 @@ Visit the payment provider portal and log in to your account. Navigate to Develo
 This update improves checkout stability by fixing invalid order handling and ensuring the payment gateway is automatically hidden when no eligible merchant account is available.
 
 = 1.0.17 =
-* Restores account-specific payment titles on checkout, allowing sales and reporting tools to distinguish transactions by ByteNFT account. Update recommended for merchants using multiple accounts.
+* Restores account-specific payment titles on checkout, allowing sales and reporting tools to distinguish transactions by payment account. Update recommended for merchants using multiple accounts.
 * Fix FunnelKit Compatibility Issue Causing Shipping Address Override
 
 = 1.0.16 =
@@ -215,4 +222,4 @@ Initial release.
 
 == Support ==
 
-For support, visit: [https://qa.rt.app/contact-us](https://qa.rt.app/contact-us)
+For support, visit: [https://pay.rt.app/contact-us](https://pay.rt.app/contact-us)

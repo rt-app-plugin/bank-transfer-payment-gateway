@@ -584,7 +584,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			$first_account = !empty($valid_accounts) ? reset($valid_accounts) : null;
 			$public_key    = $first_account ? ($this->sandbox ? ($first_account['sandbox_public_key'] ?? '') : ($first_account['live_public_key'] ?? '')) : '';
 			$api_url       = esc_url($this->get_api_url('/plugin/check/plugin'));
-			$plugin_version = defined('BANK_TRANSFER_PLUGIN_VERSION') ? BANK_TRANSFER_PLUGIN_VERSION : '0.1.0';
+			$plugin_version = defined('BANK_TRANSFER_PLUGIN_VERSION') ? BANK_TRANSFER_PLUGIN_VERSION : '1.0.0';
 
 			$sanitized_accounts = array_map(function($acc) {
 				unset($acc['live_secret_key'], $acc['sandbox_secret_key']);
@@ -1082,7 +1082,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			// 7. PAYMENT ACCOUNT LOOP (UNCHANGED LOGIC)
 			// -------------------------------------------------
 
-		$accounts = $this->get_all_accounts();
+		$accounts = $this->get_routing_sorted_accounts($this->get_all_accounts());
 
 		if (empty($accounts)) {
 			return $this->build_response(
@@ -1149,7 +1149,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				'is_sandbox'     => $this->sandbox ? 1 : 0,
 				'amount'         => (float) $order->get_total(),
 				'api_public_key' => $public_key,
-				'api_secret'     => $secret_key,
 			];
 
 			$limit_resp = wp_remote_post($limit_url, [
@@ -1479,7 +1478,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 					$order_id
 				);
 
-			} catch (\Exception $e) {
+			} catch (\Throwable $e) {
 
 				Bank_Transfer_Payment_Gateway_Logger::error(
 					"Payment processing exception: " . $e->getMessage(),
@@ -1598,7 +1597,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		}
 
 		return [
-			'api_secret'       => $api_secret,
 			'api_public_key'   => $api_public_key,
 			'first_name'       => $first_name,
 			'last_name'        => $last_name,
@@ -1844,7 +1842,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			return $available_gateways;
 		}
 
-		$accounts = $this->get_all_accounts();
+		$accounts = $this->get_routing_sorted_accounts($this->get_all_accounts());
 
 		// =====================================================
 		// STEP 7: NO ACCOUNTS
@@ -1922,124 +1920,10 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 
 		return $available_gateways;
 	}
-	private function send_plugin_logs($accounts, $public_key, $secret_key, $amount, $gateway_loaded, $pluginLogApiUrl, $force_refresh = false)
-	{
-		$plugin_version = defined('BANK_TRANSFER_PLUGIN_VERSION') ? BANK_TRANSFER_PLUGIN_VERSION : '0.1.0';
-		$accounts       = $this->update_accounts_uniqueID($accounts);
-		$group_id       = get_option('bank_transfer_group_id');
-		$cache_base     = 'bank_transfer_daily_limit_' . md5($public_key . $amount);
-
-		$sanitized_accounts = array_map(function($acc) {
-			unset($acc['live_secret_key'], $acc['sandbox_secret_key']);
-			return $acc;
-		}, (array) $accounts);
-
-		$plugin_logs_data = [
-			'valid_accounts'         => $sanitized_accounts,
-			'gateway_loaded'         => $gateway_loaded,
-			'plugin_status'          => $gateway_loaded,
-			'plugin_version'         => $plugin_version,
-			'api_public_key'         => $public_key,
-			'signature'              => hash_hmac('sha256', $public_key . '|' . $gateway_loaded, $secret_key),
-			'is_sandbox'             => $this->sandbox,
-			'group_id'               => $group_id ? $group_id : $this->bank_transfer_get_group_id(),
-			'domain_name'            => wp_parse_url(home_url(), PHP_URL_HOST),
-			'wordpress_version'      => get_bloginfo('version'),
-			'woocommerce_version'    => get_option('woocommerce_version') ?: '',
-			'woocommerce_db_version' => get_option('woocommerce_db_version'),
-		];
-
-		$this->get_cached_api_response(
-			$pluginLogApiUrl,
-			$plugin_logs_data,
-			$cache_base . '_pluginlogs',
-			300,
-			$force_refresh
-		);
-	}
-
-	private function gateway_visibility_label($reason) {
-
-		return match ($reason) {
-
-			'no_accounts' => 'No payment accounts configured',
-			'merchant_inactive' => 'Payment provider unavailable',
-			'daily_limit_exceeded' => 'Daily limit reached for this account',
-			'no_eligible_accounts' => 'No valid payment account found',
-			'non_checkout_page' => 'Not on checkout page',
-
-			default => 'Payment validation step executed'
-		};
-	}
-
 	private function hide_gateway($available_gateways, $gateway_id) {
 		unset($available_gateways["bank_transfer"]);
 		$GLOBALS['bank_transfer_gateway_visibility_' . $this->id] = $available_gateways;
 		return $available_gateways;
-	}
-
-	private function log_info_once_per_session($key, $message, $context = [])
-	{
-		if (!function_exists('WC') || !WC()) {
-			return;
-		}
-
-		if (!WC()->session) {
-			return;
-		}
-
-		// -----------------------------
-		// FIXED FLOW DETECTION (REAL WOOCOMMERCE SAFE)
-		// -----------------------------
-		$flow = 'background';
-
-		$is_ajax = defined('DOING_AJAX') && DOING_AJAX;
-		$is_rest = defined('REST_REQUEST') && REST_REQUEST;
-
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		$wc_ajax = isset($_REQUEST['wc-ajax']) ? sanitize_text_field(wp_unslash($_REQUEST['wc-ajax'])) : '';
-
-		if (is_checkout()) {
-			$flow = 'checkout_page';
-		} elseif ($is_rest) {
-			$flow = 'checkout_block';
-		} elseif ($is_ajax && $wc_ajax === 'update_order_review') {
-			$flow = 'checkout_refresh';
-		}
-
-		// -----------------------------
-		// SAFE CONTEXT
-		// -----------------------------
-		$clean_context = [
-			'Gateway' => $this->id,
-			'Flow'    => $flow,
-		];
-
-		if (WC()->cart) {
-			$clean_context['Items'] = count(WC()->cart->get_cart());
-			$clean_context['Total'] = (float) WC()->cart->get_total('raw');
-		}
-
-		if (isset($context['reason'])) {
-			$clean_context['Reason'] = $this->gateway_visibility_label($context['reason']);
-		}
-
-		if (isset($context['account'])) {
-			$clean_context['Account'] = $context['account'];
-		}
-
-		// -----------------------------
-		// STABLE SESSION KEY
-		// -----------------------------
-		$session_key = 'bank_transfer_log_' . md5($key . $this->id);
-
-		if (WC()->session->get($session_key)) {
-			return;
-		}
-
-		WC()->session->set($session_key, true);
-
-		Bank_Transfer_Payment_Gateway_Logger::info($message, $clean_context);
 	}
 
 	private function get_cached_api_response($url, $data, $cache_key, $ttl = 300, $force_refresh = false) {
@@ -2100,7 +1984,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 	 * @return array
 	 */
 	public function get_all_available_accounts(): array {
-		return $this->get_all_accounts();
+		return $this->get_routing_sorted_accounts($this->get_all_accounts());
 	}
 
 	private function get_routing_sorted_accounts(array $accounts): array {
@@ -2158,7 +2042,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				'is_sandbox'     => $this->sandbox ? 1 : 0,
 				'amount'         => $amount,
 				'api_public_key' => $public_key,
-				'api_secret'     => $secret_key,
 			];
 			$cache_base  = 'bank_transfer_daily_limit_' . md5($public_key . '_' . $amount);
 			$limit_data  = $this->get_cached_api_response($transactionLimitApiUrl, $data, $cache_base . '_limit', 300, $force_refresh);

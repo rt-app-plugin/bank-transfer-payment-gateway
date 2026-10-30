@@ -3,15 +3,15 @@
 /**
  * Plugin Name: Bank Transfer Payment Gateway
  * Description: Pay securely with Bank Transfer or Card via popup flow.
- * Author: RT
- * Author URI: https://qa.rt.app/
+ * Author: RT.app
+ * Author URI: https://rt.app/
  * Text Domain: bank-transfer-payment-gateway
- * Plugin URI: https://github.com/bytenft/bank-transfer-payment-gateway
- * Version: 0.1.0
+ * Plugin URI: https://pay.rt.app/
+ * Version: 1.0.0
  * License: GPLv3 or later
  * License URI: https://www.gnu.org/licenses/gpl-3.0.html
  *
- * Copyright (c) 2024 RT
+ * Copyright (c) 2024 RT.app
  */
 
 
@@ -112,12 +112,6 @@ function bank_transfer_cancel_unpaid_order_action($order_id)
 	}
 
 	$accounts_data = get_option('woocommerce_bank_transfer_payment_gateway_accounts', []);
-	if (empty($accounts_data)) {
-		$accounts_data = get_option('woocommerce_bytenft_payment_gateway_accounts', []);
-		if (empty($accounts_data)) {
-			$accounts_data = get_option('woocommerce_unified_payment_gateway_accounts', []);
-		}
-	}
 	if (is_string($accounts_data)) {
 		$accounts_data = maybe_unserialize($accounts_data);
 	}

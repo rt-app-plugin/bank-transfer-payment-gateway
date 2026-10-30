@@ -478,16 +478,18 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	/**
 	 * BT-15: Rate limiting helper for public AJAX actions
 	 */
-	public function check_rate_limit($action, $max_requests = 15, $period = 60)
+	public function check_rate_limit($action, $max_requests = 60, $period = 60, $extra_key = '')
 	{
 		$ip = sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'] ?? 'unknown'));
-		$transient_key = 'bt_rl_' . md5($action . '_' . $ip);
+		$key_suffix = !empty($extra_key) ? '_' . $extra_key : '';
+		$transient_key = 'bt_rl_' . md5($action . '_' . $ip . $key_suffix);
 		$count = (int) get_transient($transient_key);
 
 		if ($count >= $max_requests) {
 			wp_send_json_error([
 				'message'      => 'Too many requests. Please slow down.',
-				'stop_polling' => true,
+				'stop_polling' => false,
+				'rate_limited' => true,
 			], 429);
 			wp_die();
 		}
@@ -532,8 +534,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	{
 		if (plugin_basename(BANK_TRANSFER_PAYMENT_GATEWAY_FILE) === $file) {
 			$row_meta = [
-				'docs'    => '<a href="' . esc_url(apply_filters('bank_transfer_docs_url', 'https://qa.rt.app/docs')) . '" target="_blank">' . esc_html__('Documentation', 'bank-transfer-payment-gateway') . '</a>',
-				'support' => '<a href="' . esc_url(apply_filters('bank_transfer_support_url', 'https://qa.rt.app/contact-us')) . '" target="_blank">' . esc_html__('Support', 'bank-transfer-payment-gateway') . '</a>',
+				'docs'    => '<a href="' . esc_url(apply_filters('bank_transfer_docs_url', 'https://pay.rt.app/docs')) . '" target="_blank">' . esc_html__('Documentation', 'bank-transfer-payment-gateway') . '</a>',
+				'support' => '<a href="' . esc_url(apply_filters('bank_transfer_support_url', 'https://pay.rt.app/contact-us')) . '" target="_blank">' . esc_html__('Support', 'bank-transfer-payment-gateway') . '</a>',
 			];
 
 			$links = array_merge($links, $row_meta);
@@ -560,11 +562,10 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	 */
 	public function bank_transfer_handle_check_payment_status_request($request)
 	{
-		$this->check_rate_limit('status_check', 30, 60);
-		check_ajax_referer('bank_transfer_payment', 'security');
-
 		// Sanitize and validate the order ID from $_POST
 		$order_id = isset($_POST['order_id']) ? intval(sanitize_text_field(wp_unslash($_POST['order_id']))) : null;
+		$this->check_rate_limit('status_check', 60, 60, $order_id ? (string) $order_id : '');
+		check_ajax_referer('bank_transfer_payment', 'security');
 		if (!$order_id || $order_id <= 0) {
 			wp_send_json_error(array('message' => esc_html__('Invalid order ID', 'bank-transfer-payment-gateway')), 400);
 		}
@@ -637,7 +638,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 					'payment_token'  => $payment_token,
 					'is_sandbox'     => $is_sandbox,
 					'api_public_key' => $public_key,
-					'api_secret'     => $secret_key,
 				]),
 				'headers'   => [
 					'Content-Type'  => 'application/json',
@@ -806,11 +806,12 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	public function handle_popup_close()
 	{
 		check_ajax_referer('bank_transfer_payment', 'security');
-		$this->check_rate_limit('popup_close', 30, 60);
 
 		$order_id = isset($_POST['order_id'])
 			? intval(sanitize_text_field(wp_unslash($_POST['order_id'])))
 			: 0;
+
+		$this->check_rate_limit('popup_close', 60, 60, $order_id > 0 ? (string) $order_id : '');
 
 		$order_key = isset($_POST['order_key'])
 			? sanitize_text_field(wp_unslash($_POST['order_key']))
@@ -874,7 +875,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 					'payment_token'  => $payment_token,
 					'is_sandbox'     => $is_sandbox,
 					'api_public_key' => $public_key,
-					'api_secret'     => $secret_key,
 				]),
 				'headers'   => [
 					'Content-Type'  => 'application/json',
@@ -1057,7 +1057,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			$redirect = null; // processing → no redirect
 		}
 
-		$stop_polling = in_array($state, ['success', 'failed', 'cancelled', 'expired'], true);
+		$stop_polling = in_array($state, ['failed', 'cancelled', 'expired'], true);
 
 		// -------------------------
 		// RESPONSE
@@ -1137,7 +1137,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 				$accountsData[] = [
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['live_public_key'],
-					'secret_key'   => $account['live_secret_key'] ?? '',
 					'mode'         => 'live',
 				];
 				if (empty($first_public_key)) {
@@ -1149,7 +1148,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 				$accountsData[] = [
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['sandbox_public_key'],
-					'secret_key'   => $account['sandbox_secret_key'] ?? '',
 					'mode'         => 'sandbox',
 				];
 				if (empty($first_public_key)) {

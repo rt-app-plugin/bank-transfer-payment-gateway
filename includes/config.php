@@ -20,5 +20,5 @@ if (!defined('BANK_TRANSFER_API_BASE_URL')) {
 
 
 if (!defined('BANK_TRANSFER_PLUGIN_VERSION')) {
-    define('BANK_TRANSFER_PLUGIN_VERSION', '0.1.0');
+    define('BANK_TRANSFER_PLUGIN_VERSION', '1.0.0');
 }

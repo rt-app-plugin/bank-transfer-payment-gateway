@@ -573,20 +573,35 @@
             let redirected = false;
             let pollAttempts = 0;
             const maxAttempts = 60; // 3 minutes maximum polling (60 * 3s)
+            let currentDelay = 3000; // Base interval: 3 seconds (20 req/min)
+            const baseDelay = 3000;
+            const maxDelay = 10000;
+            let isPolling = false;
 
-            clearInterval(self.state.popupInterval);
+            if (self.state.popupInterval) {
+                clearTimeout(self.state.popupInterval);
+                clearInterval(self.state.popupInterval);
+                self.state.popupInterval = null;
+            }
 
-            self.state.popupInterval = setInterval(function () {
+            function scheduleNext(delay) {
+                if (redirected) return;
+                self.state.popupInterval = setTimeout(poll, delay);
+            }
 
+            function poll() {
                 // Prevent duplicate execution
                 if (redirected) {
-                    clearInterval(self.state.popupInterval);
                     return;
                 }
 
                 pollAttempts++;
                 if (pollAttempts > maxAttempts) {
-                    clearInterval(self.state.popupInterval);
+                    return;
+                }
+
+                if (isPolling) {
+                    scheduleNext(currentDelay);
                     return;
                 }
 
@@ -597,6 +612,7 @@
                 // =========================================
                 // SAFARI + CHROME PAYMENT CHECK
                 // =========================================
+                isPolling = true;
                 $.post(
                     bank_transfer_params.ajax_url,
                     {
@@ -606,33 +622,20 @@
                         security: bank_transfer_params.bank_transfer_nonce
                     },
                     function (response) {
+                        isPolling = false;
 
                         if (redirected) {
-                            clearInterval(self.state.popupInterval);
                             return;
                         }
 
-                        // Stop polling if server explicitly indicates stop_polling (e.g. fatal auth / order not found)
-                        if (response?.data?.stop_polling || response?.stop_polling) {
-                            clearInterval(self.state.popupInterval);
-                            const finalState = response?.data?.state || response?.state;
-                            if (!popupExists || finalState === 'failed' || finalState === 'cancelled') {
-                                redirected = true;
-                                self.cleanupPopup();
-                                self.showCheckoutError(
-                                    response?.message ||
-                                    response?.data?.message ||
-                                    'Payment verification failed. Please try again.'
-                                );
-                                self.reset();
-                            }
-                            return;
-                        }
+                        // Reset delay to base on valid response
+                        currentDelay = baseDelay;
 
                         const paymentSuccess =
                             response?.success === true ||
                             response?.data?.payment_status === 'success' ||
-                            response?.data?.payment_status === 'paid';
+                            response?.data?.payment_status === 'paid' ||
+                            response?.data?.state === 'success';
 
                         const redirectUrl =
                             response?.data?.redirect ||
@@ -645,23 +648,33 @@
 
                             redirected = true;
 
-                            clearInterval(self.state.popupInterval);
-
                             try {
-
                                 if (
                                     self.state.popup &&
                                     !self.state.popup.closed
                                 ) {
                                     self.state.popup.close();
                                 }
-
                             } catch (e) {}
 
                             self.state.popup = null;
-
                             window.location.replace(redirectUrl);
+                            return;
+                        }
 
+                        // Stop polling if server explicitly indicates stop_polling (e.g. fatal auth / order not found)
+                        if (response?.data?.stop_polling || response?.stop_polling) {
+                            const finalState = response?.data?.state || response?.state;
+                            if (finalState !== 'success' && (!popupExists || finalState === 'failed' || finalState === 'cancelled' || finalState === 'expired')) {
+                                redirected = true;
+                                self.cleanupPopup();
+                                self.showCheckoutError(
+                                    response?.message ||
+                                    response?.data?.message ||
+                                    'Payment verification failed. Please try again.'
+                                );
+                                self.reset();
+                            }
                             return;
                         }
 
@@ -672,30 +685,44 @@
 
                             redirected = true;
 
-                            clearInterval(self.state.popupInterval);
-
                             const failedMessage =
                                 response?.message ||
                                 response?.data?.message ||
                                 'Your payment could not be completed. Please try again.';
 
                             self.cleanupPopup();
-
                             self.showCheckoutError(failedMessage);
-
                             self.reset();
+                            return;
                         }
 
+                        // Continue polling
+                        scheduleNext(currentDelay);
                     },
                     'json'
                 ).fail(function (xhr, status, error) {
-                    // Stop polling if forbidden or bad request
-                    if (xhr.status === 403 || xhr.status === 400 || xhr.status === 401 || xhr.status === 429) {
-                        clearInterval(self.state.popupInterval);
-                    }
-                });
+                    isPolling = false;
+                    if (redirected) return;
 
-            }, 3000);
+                    // Back off on 429 rate limit instead of polling straight through or dying
+                    if (xhr.status === 429) {
+                        currentDelay = Math.min(currentDelay + 2000, maxDelay);
+                        scheduleNext(currentDelay);
+                        return;
+                    }
+
+                    // Stop polling if forbidden, bad request, or unauthorized
+                    if (xhr.status === 403 || xhr.status === 400 || xhr.status === 401) {
+                        return;
+                    }
+
+                    // Transient errors: back off and retry
+                    currentDelay = Math.min(currentDelay + 1500, maxDelay);
+                    scheduleNext(currentDelay);
+                });
+            }
+
+            scheduleNext(baseDelay);
         },
 
         /* =========================================================
