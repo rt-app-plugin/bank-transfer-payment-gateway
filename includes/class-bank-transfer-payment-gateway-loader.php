@@ -1129,6 +1129,9 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		$accountsData = [];
 		$first_public_key = '';
 
+		$settings = get_option('woocommerce_bank_transfer_settings', []);
+		$is_gateway_sandbox = isset($settings['sandbox']) && $settings['sandbox'] === 'yes';
+
 		foreach ($accounts as &$account) {
 			$isSandboxEnabled = isset($account['has_sandbox']) && $account['has_sandbox'] === 'on';
 
@@ -1137,9 +1140,10 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 				$accountsData[] = [
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['live_public_key'],
+					'secret_key'   => $account['live_secret_key'] ?? '',
 					'mode'         => 'live',
 				];
-				if (empty($first_public_key)) {
+				if (empty($first_public_key) && !$is_gateway_sandbox) {
 					$first_public_key = $account['live_public_key'];
 				}
 			}
@@ -1148,12 +1152,17 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 				$accountsData[] = [
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['sandbox_public_key'],
+					'secret_key'   => $account['sandbox_secret_key'] ?? '',
 					'mode'         => 'sandbox',
 				];
-				if (empty($first_public_key)) {
+				if (empty($first_public_key) && $is_gateway_sandbox) {
 					$first_public_key = $account['sandbox_public_key'];
 				}
 			}
+		}
+
+		if (empty($first_public_key) && !empty($accountsData)) {
+			$first_public_key = $accountsData[0]['public_key'];
 		}
 
 		if (empty($accountsData)) {
@@ -1179,12 +1188,14 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 
 		$response_code = wp_remote_retrieve_response_code($response);
 		if ($response_code < 200 || $response_code >= 300) {
+			$err_body = wp_remote_retrieve_body($response);
 			Bank_Transfer_Payment_Gateway_Logger::warning(
 				'Sync API returned a non-2xx HTTP status. Sync aborted.',
 				array_merge($logger_context, [
 					'context' => [
 						'http_status' => $response_code,
 						'url'         => $url,
+						'response'    => $err_body,
 					],
 				])
 			);
@@ -1323,18 +1334,33 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			return;
 		}
 
-		// Find first available public key
+		$settings = get_option('woocommerce_bank_transfer_settings', []);
+		$is_sandbox = isset($settings['sandbox']) && $settings['sandbox'] === 'yes';
+
+		// Find first available public key matching current mode
 		$public_key = '';
 
 		foreach ($accounts as $account) {
-			if (!empty($account['live_public_key'])) {
+			if ($is_sandbox && !empty($account['sandbox_public_key'])) {
+				$public_key = $account['sandbox_public_key'];
+				break;
+			}
+			if (!$is_sandbox && !empty($account['live_public_key'])) {
 				$public_key = $account['live_public_key'];
 				break;
 			}
+		}
 
-			if (!empty($account['sandbox_public_key'])) {
-				$public_key = $account['sandbox_public_key'];
-				break;
+		if (empty($public_key)) {
+			foreach ($accounts as $account) {
+				if (!empty($account['sandbox_public_key'])) {
+					$public_key = $account['sandbox_public_key'];
+					break;
+				}
+				if (!empty($account['live_public_key'])) {
+					$public_key = $account['live_public_key'];
+					break;
+				}
 			}
 		}
 
