@@ -1011,6 +1011,20 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			);
 		}
 
+		if ($order->get_payment_method() !== self::ID) {
+			if (function_exists('wc_add_notice') && is_checkout()) {
+				wc_add_notice(__('Invalid payment method.', 'bank-transfer-payment-gateway'), 'error');
+			}
+
+			return $this->build_response(
+				'fail',
+				'Invalid payment method.',
+				[],
+				400,
+				$order_id
+			);
+		}
+
 		$plugin_version = $this->get_plugin_version();
 		if (!empty($plugin_version)) {
 			$order->update_meta_data('_bank_transfer_plugin_version', sanitize_text_field($plugin_version));
@@ -1629,6 +1643,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		}
 
 		return [
+			'api_secret'       => $api_secret,
 			'api_public_key'   => $api_public_key,
 			'first_name'       => $first_name,
 			'last_name'        => $last_name,

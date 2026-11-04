@@ -112,6 +112,13 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			die;
 		}
 
+		// Force payment method to bank_transfer (never trust posted value)
+		$_POST['payment_method'] = 'bank_transfer';
+		$_REQUEST['payment_method'] = 'bank_transfer';
+		if (empty($_POST['bank_transfer_nonce'])) {
+			$_POST['bank_transfer_nonce'] = $nonce;
+		}
+
 		// Pull the already-initialised gateway from the WC registry.
 		// Never use `new BANK_TRANSFER_PAYMENT_GATEWAY()` here — see note above.
 		$gateways       = WC()->payment_gateways()->payment_gateways();
@@ -130,43 +137,19 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			);
 		}
 
-		$orderID = WC()->session
-			? ( WC()->session->get('store_api_draft_order') ?: WC()->session->get('order_awaiting_payment') )
-			: null;
-
-		/*
-		 * WooCommerce 10.8+ writes 'store_api_draft_order' in exactly one place:
-		 * the Store API /checkout route (StoreApi/Routes/V1/Checkout.php). This
-		 * handler bypasses that route - the JS calls preventDefault() on Place
-		 * Order and posts here instead - so on WooCommerce 11 the key is never
-		 * set and every block checkout ended at "Invalid order.".
-		 *
-		 * Older WooCommerce created the draft order during the cart routes, so
-		 * the key was already populated by the time Place Order ran. That is why
-		 * this worked in 1.0.16 and stopped working since.
-		 *
-		 * Build the order here, ALWAYS - not only when the pointers are empty.
-		 *
-		 * Reusing a session order id verbatim was sending whatever total that
-		 * order was built with. Once an attempt had been rejected, changing the
-		 * amount changed the cart but never the order, so request-payment kept
-		 * receiving the identical order+amount and kept answering "This order
-		 * appears to be a duplicate".
-		 *
-		 * WC_Checkout::create_order() already resolves this correctly: it
-		 * resumes 'order_awaiting_payment' only while the cart hash still
-		 * matches and the order is pending/failed, otherwise it starts a new
-		 * order - and either way it calls set_data_from_cart(), so items,
-		 * shipping, coupons and totals are rebuilt from the current cart every
-		 * time. A changed amount therefore produces a correct amount, and a
-		 * changed cart produces a new order id that is not a duplicate.
-		 *
-		 * The session pointers stay as the fallback for the case where there is
-		 * no cart to build from.
-		 */
-		if ( ! empty( WC()->cart ) && ! WC()->cart->is_empty() ) {
-			$orderID = $this->bank_transfer_create_block_order() ?: $orderID;
+		// Route Block Checkout AJAX requests through WooCommerce's standard checkout validation pipeline using WC()->checkout()->process_checkout() wherever compatible
+		$wc_nonce = isset($_REQUEST['woocommerce-process-checkout-nonce']) ? $_REQUEST['woocommerce-process-checkout-nonce'] : (isset($_REQUEST['_wpnonce']) ? $_REQUEST['_wpnonce'] : '');
+		if (!empty($wc_nonce) && wp_verify_nonce($wc_nonce, 'woocommerce-process_checkout')) {
+			WC()->checkout()->process_checkout();
+			wp_die();
 		}
+
+		if ( empty( WC()->cart ) || WC()->cart->is_empty() ) {
+			wp_send_json(['result' => 'fail', 'error' => __('Your cart is currently empty.', 'woocommerce')]);
+			die;
+		}
+
+		$orderID = $this->bank_transfer_create_block_order($bank_transferPayment);
 
 		$status = [];
 		if($orderID){
@@ -183,13 +166,14 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	/**
 	 * Create the WooCommerce order for a block checkout payment.
 	 *
-	 * Delegates to WC_Checkout::create_order() so line items, shipping lines,
-	 * coupons, taxes and totals are built by WooCommerce itself rather than by
-	 * hand here.
+	 * Executes WooCommerce checkout validation pipeline (billing, shipping,
+	 * terms, CAPTCHA/anti-fraud, after_checkout_validation, gateway validate_fields)
+	 * and creates the order.
 	 *
+	 * @param WC_Payment_Gateway|null $bank_transferPayment
 	 * @return int Order ID, or 0 on failure.
 	 */
-	private function bank_transfer_create_block_order() {
+	private function bank_transfer_create_block_order($bank_transferPayment = null) {
 
 		$checkout = WC()->checkout();
 		$data     = $checkout->get_posted_data();
@@ -246,8 +230,101 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			}
 		}
 
-		if ( empty( $data['payment_method'] ) ) {
-			$data['payment_method'] = 'bank_transfer';
+		// Force payment method to bank_transfer (never trust posted value)
+		$data['payment_method'] = 'bank_transfer';
+
+		// ---------------------------------------------------------------------
+		// 1. BILLING AND SHIPPING FIELD VALIDATION
+		// ---------------------------------------------------------------------
+		$errors          = new WP_Error();
+		$checkout_fields = $checkout->get_checkout_fields();
+
+		if ( ! empty( $checkout_fields['billing'] ) ) {
+			foreach ( $checkout_fields['billing'] as $key => $field ) {
+				$val = $data[ $key ] ?? '';
+				if ( ! empty( $field['required'] ) && '' === trim( (string) $val ) ) {
+					$label = $field['label'] ?? $key;
+					$errors->add( $key . '_required', sprintf( __( '%s is a required field.', 'woocommerce' ), '<strong>' . esc_html( $label ) . '</strong>' ) );
+				}
+				if ( ! empty( $field['validate'] ) && in_array( 'email', (array) $field['validate'], true ) && '' !== $val ) {
+					if ( ! is_email( $val ) ) {
+						$label = $field['label'] ?? $key;
+						$errors->add( $key . '_validation', sprintf( __( '%s is not a valid email address.', 'woocommerce' ), '<strong>' . esc_html( $label ) . '</strong>' ) );
+					}
+				}
+			}
+		}
+
+		if ( WC()->cart && WC()->cart->needs_shipping() ) {
+			$ship_to_different = ! empty( $data['ship_to_different_address'] );
+			$shipping_country  = $ship_to_different
+				? ( $data['shipping_country'] ?? ( $customer ? $customer->get_shipping_country() : '' ) )
+				: ( $data['billing_country'] ?? ( $customer ? $customer->get_billing_country() : '' ) );
+
+			if ( empty( $shipping_country ) ) {
+				$errors->add( 'shipping', __( 'Please enter an address to continue.', 'woocommerce' ) );
+			} elseif ( ! in_array( $shipping_country, array_keys( WC()->countries->get_shipping_countries() ), true ) ) {
+				$errors->add( 'shipping', __( 'Unfortunately, we do not ship to your location. Please enter an alternative shipping address.', 'woocommerce' ) );
+			}
+
+			if ( $ship_to_different && ! empty( $checkout_fields['shipping'] ) ) {
+				foreach ( $checkout_fields['shipping'] as $key => $field ) {
+					$val = $data[ $key ] ?? ( $customer && is_callable( [ $customer, 'get_' . $key ] ) ? $customer->{'get_' . $key}() : '' );
+					if ( ! empty( $field['required'] ) && '' === trim( (string) $val ) ) {
+						$label = $field['label'] ?? $key;
+						$errors->add( $key . '_required', sprintf( __( 'Shipping %s is a required field.', 'woocommerce' ), '<strong>' . esc_html( $label ) . '</strong>' ) );
+					}
+				}
+			}
+		}
+
+		// ---------------------------------------------------------------------
+		// 2. TERMS AND CONDITIONS VALIDATION
+		// ---------------------------------------------------------------------
+		$terms_page_id = function_exists('wc_terms_and_conditions_page_id') ? wc_terms_and_conditions_page_id() : 0;
+		if ( $terms_page_id > 0 && function_exists('wc_terms_and_conditions_checkbox_enabled') && wc_terms_and_conditions_checkbox_enabled() ) {
+			$terms_accepted = ! empty( $_POST['terms'] ) || ! empty( $data['terms'] );
+			if ( ! $terms_accepted ) {
+				$errors->add( 'terms', __( 'Please read and accept the terms and conditions to proceed with your order.', 'woocommerce' ) );
+			}
+		}
+
+		// ---------------------------------------------------------------------
+		// 3. CHECKOUT PROCESS HOOKS (CAPTCHA & ANTI-FRAUD)
+		// ---------------------------------------------------------------------
+		do_action( 'woocommerce_before_checkout_process' );
+		do_action( 'woocommerce_checkout_process' );
+
+		// ---------------------------------------------------------------------
+		// 4. AFTER CHECKOUT VALIDATION HOOKS (GATEWAY PHONE/ZIP & ANTI-FRAUD)
+		// ---------------------------------------------------------------------
+		do_action( 'woocommerce_after_checkout_validation', $data, $errors );
+
+		if ( $errors->has_errors() || wc_notice_count( 'error' ) > 0 ) {
+			$err_msg = $errors->has_errors() ? $errors->get_error_message() : '';
+			if ( empty( $err_msg ) && wc_notice_count( 'error' ) > 0 ) {
+				$notices = wc_get_notices( 'error' );
+				$first   = reset( $notices );
+				$err_msg = is_array( $first ) ? ( $first['notice'] ?? '' ) : (string) $first;
+			}
+			wc_clear_notices();
+			wp_send_json( [ 'result' => 'fail', 'error' => wp_strip_all_tags( $err_msg ?: 'Validation failed.' ) ] );
+			die;
+		}
+
+		// ---------------------------------------------------------------------
+		// 5. GATEWAY FIELD VALIDATION (CONSENT CHECKBOX, ETC.)
+		// ---------------------------------------------------------------------
+		if ( $bank_transferPayment && ! $bank_transferPayment->validate_fields() ) {
+			$notices = wc_get_notices( 'error' );
+			$err_msg = 'Validation failed.';
+			if ( ! empty( $notices ) ) {
+				$first   = reset( $notices );
+				$err_msg = is_array( $first ) ? ( $first['notice'] ?? $err_msg ) : (string) $first;
+			}
+			wc_clear_notices();
+			wp_send_json( [ 'result' => 'fail', 'error' => wp_strip_all_tags( $err_msg ) ] );
+			die;
 		}
 
 		// Prevent reusing an order if the email address OR phone number doesn't match
@@ -267,16 +344,18 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 
 		$order_id = $checkout->create_order( $data );
 
-		if ( is_wp_error( $order_id ) ) {
+		if ( is_wp_error( $order_id ) || ! $order_id ) {
 
+			$error_message = is_wp_error( $order_id ) ? $order_id->get_error_message() : 'Could not create order for block checkout';
 			Bank_Transfer_Payment_Gateway_Logger::error(
 				'Could not create order for block checkout',
 				[
-					'error' => $order_id->get_error_message(),
+					'error' => $error_message,
 				]
 			);
 
-			return 0;
+			wp_send_json( [ 'result' => 'fail', 'error' => $error_message ] );
+			die;
 		}
 
 		if ( WC()->session ) {

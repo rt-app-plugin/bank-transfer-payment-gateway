@@ -103,7 +103,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 			}
 			$pub = $is_sandbox ? ($account['sandbox_public_key'] ?? '') : ($account['live_public_key'] ?? '');
 			$sec = $is_sandbox ? ($account['sandbox_secret_key'] ?? '') : ($account['live_secret_key'] ?? '');
-			$sec = trim(trim(sanitize_text_field($sec)), '"\'');
+			$sec = trim(trim((string) $sec), '"\'');
 
 			if (empty($sec)) {
 				continue;
@@ -120,9 +120,9 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 			return false;
 		}
 
-		// 1. Check HMAC signature if provided
-		$sig_header       = $request->get_header('x-signature');
-		$timestamp_header = $request->get_header('x-timestamp');
+		// Mandatory HMAC verification with X-Signature and X-Timestamp
+		$sig_header       = (string) $request->get_header('x-signature');
+		$timestamp_header = (string) $request->get_header('x-timestamp');
 
 		if (!empty($sig_header) && !empty($timestamp_header)) {
 			// X-Timestamp must be a strict unsigned digit string (rejects "123abc", signs, floats, exponents).
@@ -149,31 +149,23 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 			return false;
 		}
 
-		// 2. Fallback to secret key in authorization header or nonce parameter (reject public keys)
-		$params      = $request->get_params();
-		$api_key_raw = trim(trim($params['nonce'] ?? ''), '"\'');
+		if (abs(time() - (int) $timestamp_header) > 300) {
+			Bank_Transfer_Payment_Gateway_Logger::warning('Webhook timestamp expired', [
+				'source'    => 'bank-transfer-payment-gateway',
+				'timestamp' => (int) $timestamp_header,
+			]);
+			return false;
+		}
 
-		if (empty($api_key_raw)) {
-			$auth_header = $request->get_header('authorization');
-			if (!empty($auth_header) && preg_match('/Bearer\s+(\S+)/i', $auth_header, $matches)) {
-				$api_key_raw = $matches[1];
-			} elseif (!empty($request->get_header('x-api-key'))) {
-				$api_key_raw = $request->get_header('x-api-key');
+		$raw_body = $request->get_body();
+		foreach ($valid_secrets as $secret) {
+			$expected_sig = hash_hmac('sha256', $timestamp_header . '.' . $raw_body, $secret);
+			if (hash_equals($expected_sig, $sig_header)) {
+				return true;
 			}
 		}
 
-		if (!empty($api_key_raw)) {
-			$decoded_nonce = base64_decode($api_key_raw, true);
-			$key_to_verify = ($decoded_nonce !== false && !empty($decoded_nonce)) ? $decoded_nonce : $api_key_raw;
-			$key_to_verify = trim(trim(sanitize_text_field($key_to_verify)), '"\'');
-
-			foreach ($valid_secrets as $secret) {
-				if (hash_equals($secret, $key_to_verify) || hash_equals($secret, $api_key_raw)) {
-					return true;
-				}
-			}
-		}
-
+		Bank_Transfer_Payment_Gateway_Logger::warning('Webhook HMAC signature mismatch', ['source' => 'bank-transfer-payment-gateway']);
 		return false;
 	}
 
@@ -186,26 +178,22 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 	public function bank_transfer_handle_api_request(WP_REST_Request $request)
 	{
 		$method      = strtoupper($request->get_method());
-		$params      = $request->get_params();
 		$log_context = ['source' => 'bank-transfer-payment-gateway'];
-
-		$data = isset($params['api_data']) && is_array($params['api_data']) ? $params['api_data'] : $params;
-
-		$order_id         = intval($data['order_id'] ?? ($params['order_id'] ?? 0));
-		$api_order_status = trim(trim(sanitize_text_field($data['order_status'] ?? ($params['order_status'] ?? ''))), '"\'');
-		$pay_id           = trim(trim(sanitize_text_field($data['pay_id'] ?? ($params['pay_id'] ?? ''))), '"\'');
-
-		Bank_Transfer_Payment_Gateway_Logger::info(
-			"Bank Transfer API HIT | Method: {$method} | Order #{$order_id} | Status: {$api_order_status} | Pay ID: {$pay_id}",
-			$log_context
-		);
 
 		// -------------------------
 		// 1. GET (RETURN / REDIRECT ONLY) - BT-01 & BT-02
 		// -------------------------
 		if ($method === 'GET') {
-			$provided_key = sanitize_text_field($data['key'] ?? ($params['key'] ?? ($data['order_key'] ?? ($params['order_key'] ?? ''))));
-			$order        = ($order_id > 0) ? wc_get_order($order_id) : false;
+			$params       = $request->get_params();
+			$order_id     = intval($params['order_id'] ?? 0);
+			$provided_key = sanitize_text_field($params['key'] ?? ($params['order_key'] ?? ''));
+
+			Bank_Transfer_Payment_Gateway_Logger::info(
+				"Bank Transfer API HIT | Method: {$method} | Order #{$order_id}",
+				$log_context
+			);
+
+			$order = ($order_id > 0) ? wc_get_order($order_id) : false;
 
 			// Verify order existence, order key, and payment method uniformly to prevent ID enumeration
 			if (
@@ -245,6 +233,26 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 				'message' => 'Method not allowed'
 			], 405);
 		}
+
+		$raw_body = $request->get_body();
+		$body     = json_decode($raw_body, true);
+		if (!is_array($body)) {
+			return new WP_REST_Response([
+				'success' => false,
+				'message' => 'Invalid payload'
+			], 400);
+		}
+
+		$data = isset($body['api_data']) && is_array($body['api_data']) ? $body['api_data'] : $body;
+
+		$order_id         = intval($data['order_id'] ?? 0);
+		$api_order_status = trim(trim(sanitize_text_field($data['order_status'] ?? '')), '"\'');
+		$pay_id           = trim(trim(sanitize_text_field($data['pay_id'] ?? '')), '"\'');
+
+		Bank_Transfer_Payment_Gateway_Logger::info(
+			"Bank Transfer API HIT | Method: {$method} | Order #{$order_id} | Status: {$api_order_status} | Pay ID: {$pay_id}",
+			$log_context
+		);
 
 		if ($order_id <= 0) {
 			return new WP_REST_Response([
