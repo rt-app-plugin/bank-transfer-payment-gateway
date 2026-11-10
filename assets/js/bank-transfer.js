@@ -1,16 +1,3 @@
-/**
- * Classic (shortcode) checkout flow for RT Bank Transfer.
- *
- * Place Order is submitted to WooCommerce's own checkout endpoint, so every
- * WooCommerce validation and hook runs server-side; this script only opens
- * the RT payment page in a popup (opened synchronously on the click so
- * browsers allow it) and polls the shop for the payment outcome.
- *
- * The block checkout does not use this file (see bank-transfer-blocks.js).
- *
- * BK-11: this script never rewrites billing fields. Validation of names,
- * addresses and postcodes is the server's job.
- */
 (function ($, window, document) {
     'use strict';
 
@@ -41,6 +28,10 @@
         init: function () {
 
             this.bindClassicCheckout();
+
+            this.bindBlockCheckout();
+
+            this.bindInputSanitization();
         },
 
         /* =========================================================
@@ -128,6 +119,149 @@
         },
 
         /* =========================================================
+         * BLOCK CHECKOUT
+         * ========================================================= */
+
+        bindBlockCheckout: function () {
+
+            const self = this;
+
+            document.addEventListener(
+                'click',
+                function (e) {
+
+                    const btn = e.target.closest(
+                        '.wc-block-components-checkout-place-order-button'
+                    );
+
+                    if (!btn) {
+                        return;
+                    }
+
+                    const $form = $('form.wc-block-checkout__form');
+
+                    if (!$form.length) {
+                        return;
+                    }
+
+                    const selected = $form
+                        .find(
+                            'input[name="radio-control-wc-payment-method-options"]:checked'
+                        )
+                        .val();
+
+                    if (selected !== self.PAYMENT_METHOD) {
+                        return;
+                    }
+
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+
+                    if (self.state.submitting) {
+                        return;
+                    }
+
+                    self.clearCheckoutErrors();
+
+                    // Safari popup fix
+                    self.openPopupImmediately();
+
+                    // Start block flow
+                    self.handleBlockCheckout($form);
+
+                },
+                true
+            );
+
+            // Prevent Woo block native submit
+            document.addEventListener(
+                'submit',
+                function (e) {
+
+                    const form = e.target;
+
+                    if (!form.classList.contains('wc-block-checkout__form')) {
+                        return;
+                    }
+
+                    const selected = form.querySelector(
+                        'input[name="radio-control-wc-payment-method-options"]:checked'
+                    )?.value;
+
+                    if (selected !== self.PAYMENT_METHOD) {
+                        return;
+                    }
+
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+
+                },
+                true
+            );
+        },
+
+        handleBlockCheckout: function ($form) {
+
+            const self = this;
+
+            self.state.submitting = true;
+
+            self.state.button = $(
+                '.wc-block-components-checkout-place-order-button'
+            );
+
+            self.state.buttonText = self.state.button.text();
+
+            self.state.button
+                .prop('disabled', true)
+                .addClass('loading')
+                .text('Processing...');
+
+            let data = $form.serialize();
+
+            // Extract email and phone directly to avoid Store API sync race conditions
+            let emailField = document.querySelector('input[type="email"], #email');
+            if (emailField && emailField.value) {
+                data += '&billing_email=' + encodeURIComponent(emailField.value);
+            }
+            let phoneField = document.querySelector('input[type="tel"], #phone, input[name="phone"]');
+            if (phoneField && phoneField.value) {
+                data += '&billing_phone=' + encodeURIComponent(phoneField.value);
+            }
+
+            if (typeof bank_transfer_params !== 'undefined' && bank_transfer_params.plugin_version) {
+                data += '&plugin_version=' + encodeURIComponent(bank_transfer_params.plugin_version);
+            }
+            data += '&action=bank_transfer_block_gateway_process';
+            data += '&nonce=' + encodeURIComponent(bank_transfer_params.bank_transfer_nonce);
+
+            $.ajax({
+
+                type: 'POST',
+
+                url: bank_transfer_params.ajax_url,
+
+                data: data,
+
+                success: function (response) {
+
+                    self.handleResponse(response);
+                },
+
+                error: function (xhr, status, error) {
+
+                    self.showCheckoutError(
+                        'There was an error processing your order.'
+                    );
+
+                    self.cleanupPopup();
+
+                    self.reset();
+                }
+            });
+        },
+
+        /* =========================================================
          * RESPONSE HANDLER
          * ========================================================= */
 
@@ -157,7 +291,9 @@
 
                 const success =
                     response?.result === 'success' ||
-                    response?.success === true;
+                    response?.success === true ||
+                    response?.data?.payment_status === 'success' ||
+                    response?.data?.payment_status === 'paid';
 
                 const redirect =
                     response.redirect ||
@@ -196,7 +332,7 @@
                 }
 
                 // =====================================================
-                // FAILURE
+                // ❌ FAILURE (FIXED - ERROR DISPLAY STABLE)
                 // =====================================================
                 if (!success) {
 
@@ -204,6 +340,7 @@
 
                     self.cleanupPopup();
 
+                    // 🔥 IMPORTANT
                     setTimeout(function () {
 
                         self.showCheckoutError(msg);
@@ -219,6 +356,7 @@
 
                     }, 50);
 
+                    // 🔥 IMPORTANT
                     setTimeout(function () {
                         self.reset();
                     }, 400);
@@ -227,23 +365,23 @@
                 }
 
                 // =====================================================
-                // SUCCESS: navigate popup WITHOUT sending referrer
-                // =====================================================
+                // ✅ SUCCESS — navigate popup WITHOUT sending referrer
+                // =====================================================    
                 if (redirect && typeof redirect === 'string' && redirect.length > 5) {
 
                     if (self.state.popup && !self.state.popup.closed) {
 
                         try {
 
-                            // Use navigateWithoutReferrer instead of
+                            // FIX: Use navigateWithoutReferrer instead of
                             // directly setting location.href, which would
                             // send the WP checkout URL as Referer header
-                            // to the payment page.
+                            // to the Laravel payment page.
                             self.navigateWithoutReferrer(self.state.popup, redirect);
 
                         } catch (e) {
 
-                            // Safari fallback: re-open popup and use same method
+                            // Safari fallback — re-open popup and use same method
                             if (!self.state.popup || self.state.popup.closed) {
                                 self.state.popup = window.open(
                                     '',
@@ -294,10 +432,10 @@
                 return;
             }
 
-            // NOTE: window.open() only takes 3 arguments. noopener/noreferrer
-            // do NOT go here when opening about:blank because we need to keep
-            // the popup reference to write into it. Referrer stripping is
-            // handled by navigateWithoutReferrer().
+            // NOTE: window.open() only takes 3 arguments — the 4th is ignored
+            // by all browsers. noopener/noreferrer do NOT go here when opening
+            // about:blank because we need to keep the popup reference to write
+            // into it. Referrer stripping is handled by navigateWithoutReferrer().
             this.state.popup = window.open(
                 '',
                 '_blank',
@@ -315,8 +453,8 @@
                 ? encodeURI(bank_transfer_params.bank_transfer_loader)
                 : '';
 
-            // <meta name="referrer" content="no-referrer"> so that even this
-            // loading page does not leak referrer on any resource loads.
+            // FIX: Add <meta name="referrer" content="no-referrer"> so that
+            // even this loading page does not leak referrer on any resource loads.
             this.state.popup.document.write(`
                 <!DOCTYPE html>
                 <html>
@@ -471,7 +609,7 @@
                 $.post(
                     bank_transfer_params.ajax_url,
                     {
-                        action: 'rt_bank_transfer_popup_closed_event',
+                        action: 'bank_transfer_popup_closed_event',
                         order_id: self.state.orderId,
                         order_key: self.state.orderKey,
                         security: bank_transfer_params.bank_transfer_nonce
@@ -502,19 +640,17 @@
 
                         const paymentSuccess =
                             response?.success === true ||
-                            response?.data?.state === 'success';
-
-                        const inFlight =
-                            response?.data?.state === 'processing';
+                            response?.data?.payment_status === 'success' ||
+                            response?.data?.payment_status === 'paid';
 
                         const redirectUrl =
                             response?.data?.redirect ||
                             response?.redirect;
 
                         // =========================================
-                        // PAYMENT SETTLED, OR DEBIT AUTHORISED (IN FLIGHT)
+                        // PAYMENT SUCCESS
                         // =========================================
-                        if ((paymentSuccess || inFlight) && redirectUrl) {
+                        if (paymentSuccess && redirectUrl) {
 
                             redirected = true;
 
@@ -597,11 +733,18 @@
 
             $wrapper.append($box);
 
-            const classicTarget = $('form.checkout');
-            if (classicTarget.length) {
-                classicTarget.prepend($wrapper);
+            // Block checkout
+            const blockTarget = $('.wc-block-checkout__form');
+
+            if (blockTarget.length) {
+                blockTarget.prepend($wrapper);
             } else {
-                $('body').prepend($wrapper);
+                const classicTarget = $('form.checkout');
+                if (classicTarget.length) {
+                    classicTarget.prepend($wrapper);
+                } else {
+                    $('body').prepend($wrapper);
+                }
             }
 
             // Scroll to top notice
@@ -621,6 +764,8 @@
 
             $('.woocommerce-error').remove();
 
+            $('.wc-block-components-notice-banner').remove();
+
             $('.woocommerce-message').remove();
 
             $('.woocommerce-info').remove();
@@ -630,9 +775,17 @@
 
             this.state.submitting = false;
 
-            const $button = $(
+            const $blockButton = $(
+                '.wc-block-components-checkout-place-order-button'
+            );
+
+            const $classicButton = $(
                 'button[name="woocommerce_checkout_place_order"]'
             );
+
+            const $button = $blockButton.length
+                ? $blockButton
+                : $classicButton;
 
             if (!$button.length) {
                 return;
@@ -654,6 +807,72 @@
                 .text(
                     this.state.buttonText || 'Place order'
                 );
+        },
+
+        /* =========================================================
+         * SANITIZATION
+         * ========================================================= */
+
+        bindInputSanitization: function () {
+            const isBankTransferSelected = () => {
+                const method = $('input[name="payment_method"]:checked').val() || $('input[name="radio-control-wc-payment-method-options"]:checked').val();
+                return method === 'bank_transfer';
+            };
+
+            const selectors = `
+                #billing_first_name,
+                #billing-first_name,
+                #billing_last_name,
+                #billing-last_name,
+                #billing_city,
+                #billing-city,
+                input[name="billing_first_name"],
+                input[name="billing_last_name"],
+                input[name="billing_city"]
+            `;
+
+            const sanitizeInput = (input) => {
+                if (!isBankTransferSelected()) {
+                    return;
+                }
+                const clean = input.value.replace(
+                    /[^A-Za-z\s'\-]/g,
+                    ''
+                );
+
+                if (input.value !== clean) {
+                    Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype,
+                        'value'
+                    ).set.call(input, clean);
+
+                    input.dispatchEvent(
+                        new Event('input', { bubbles: true })
+                    );
+                }
+            };
+
+            $(document).on(
+                'input keyup blur change paste',
+                selectors,
+                function () {
+                    const input = this;
+                    setTimeout(() => {
+                        sanitizeInput(input);
+                    }, 0);
+                }
+            );
+
+            $('#billing_address_1')
+                .on('input', function () {
+                    if (!isBankTransferSelected()) {
+                        return;
+                    }
+                    this.value = this.value.replace(
+                        /[^A-Za-z0-9\s,.\-#]/g,
+                        ''
+                    );
+                });
         }
     };
 

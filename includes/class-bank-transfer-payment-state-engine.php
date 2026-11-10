@@ -1,29 +1,11 @@
 <?php
 if (!defined('ABSPATH')) exit;
 
-require_once plugin_dir_path(__FILE__) . 'config.php';
-require_once plugin_dir_path(__FILE__) . 'bank-transfer-payment-gateway-utils.php';
-
-/**
- * The order's payment state machine.
- *
- * States: pending (link open, nothing authorised), processing (the ACH debit
- * is in flight: customer authorised, money not settled -- WooCommerce
- * on-hold), success (funds settled -- processing/completed), failed,
- * cancelled, expired, returned (a settled debit the bank sent back --
- * WooCommerce "Payment returned").
- *
- * success is final for every source except a signed RT webhook, which alone
- * may move a paid order to returned (BK-01). A second settled payment on a
- * paid order is never applied; it is flagged for a refund (BK-04).
- */
 class BANK_TRANSFER_PAYMENT_ENGINE
 {
     const LOCK_TTL  = 12;
     const EVENT_TTL = 86400;
 
-    /** Event types whose payload came from an RT webhook verified with the merchant secret. */
-    const SIGNED_EVENT_TYPES = ['webhook_update'];
 
     /* =========================================================
      * ENTRY POINT
@@ -33,8 +15,8 @@ class BANK_TRANSFER_PAYMENT_ENGINE
         $order = wc_get_order($order_id);
         if (!$order || !is_a($order, 'WC_Order')) return false;
 
-        if (!bank_transfer_is_gateway_order($order)) {
-            Bank_Transfer_Payment_Gateway_Logger::warning('Rejected event: order payment method is not this gateway.', [
+        if ($order->get_payment_method() !== 'bank_transfer') {
+            Bank_Transfer_Payment_Gateway_Logger::warning('Rejected event: order payment method is not bank_transfer.', [
                 'order_id' => $order_id,
             ]);
             return false;
@@ -63,61 +45,43 @@ class BANK_TRANSFER_PAYMENT_ENGINE
                 return self::safe_response($order, 'no_state', $current_state);
             }
 
-            $is_signed      = in_array($event_type, self::SIGNED_EVENT_TYPES, true);
-            $can_transition = null;
-
             if ($current_state === 'success') {
-                /*
-                 * BK-01: RT reports a return / reversal of a SETTLED debit as
-                 * "returned" (with the bank's R-code), and the request itself as
-                 * "failed". Either word on a paid order, from a signed webhook
-                 * only, moves the order out of processing. This is the one
-                 * transition out of success; the map below never allows it.
-                 */
-                if ($is_signed && in_array($new_state, ['returned', 'failed'], true)) {
-                    $new_state      = 'returned';
+                if ($new_state === 'returned' && $event_type === 'webhook_update') {
                     $can_transition = true;
                 } elseif ($new_state === 'success') {
-                    /*
-                     * BK-04: a second settled payment for an order that is already
-                     * paid (another link was created and paid while the first
-                     * debit was in flight). The order stays paid once; the extra
-                     * payment is flagged for a refund.
-                     */
-                    $token = (string) ($payload['payment_token'] ?? '');
-                    $paid  = (string) $order->get_meta('_bank_transfer_pay_id');
-                    if ($token !== '' && $paid !== '' && !hash_equals($paid, $token)) {
-                        self::flag_duplicate_payment($order, $token, $event_type);
-                        self::mark_event($order_id, $event_id);
-                        return self::safe_response($order, 'duplicate_payment_flagged', 'success');
+                    $incoming_token = $payload['payment_token'] ?? ($payload['pay_id'] ?? '');
+                    $stored_token = $order->get_transaction_id() ?: $order->get_meta('_bank_transfer_pay_id');
+                    if (!empty($incoming_token) && !empty($stored_token) && !hash_equals((string) $stored_token, (string) $incoming_token)) {
+                        $order->add_order_note(sprintf(
+                            /* translators: 1: incoming pay_id, 2: stored pay_id */
+                            __('Warning: Duplicate payment success received for token %1$s. Order was already settled with token %2$s.', 'bank-transfer-payment-gateway'),
+                            esc_html($incoming_token),
+                            esc_html($stored_token)
+                        ));
+                        $order->save();
                     }
                     return self::safe_response($order, 'final_success_locked', 'success');
                 } else {
                     return self::safe_response($order, 'final_success_locked', 'success');
                 }
-            } elseif ($new_state === 'returned') {
-                // A return only makes sense for money that arrived.
-                return self::safe_response($order, 'invalid_transition_blocked', $current_state);
+            } else {
+                $can_transition = self::can_transition($current_state, $new_state);
             }
 
-            if ($can_transition === null) {
-                $can_transition = self::can_transition($current_state, $new_state);
-
-                /**
-                 * A verified successful payment must always be able to settle an order
-                 * that is still waiting for money. The engine state can lag behind the
-                 * backend (pending / on-hold / checkout-draft / processing / failed) or
-                 * record a closed attempt (cancelled / expired) while the transfer still
-                 * arrived afterwards. In every one of those cases the money is in the
-                 * merchant account, so WooCommerce has to reflect it.
-                 */
-                if ($new_state === 'success') {
-                    $can_transition = in_array(
-                        $current_state,
-                        ['pending', 'on-hold', 'checkout-draft', 'processing', 'failed', 'cancelled', 'expired'],
-                        true
-                    );
-                }
+            /**
+             * A verified successful payment must always be able to settle an order
+             * that is still waiting for money. The engine state can lag behind the
+             * backend (pending / on-hold / checkout-draft / processing / failed) or
+             * record a closed attempt (cancelled / expired) while the transfer still
+             * arrived afterwards. In every one of those cases the money is in the
+             * merchant account, so WooCommerce has to reflect it.
+             */
+            if ($new_state === 'success') {
+                $can_transition = in_array(
+                    $current_state,
+                    ['pending', 'on-hold', 'checkout-draft', 'processing', 'failed', 'cancelled', 'expired'],
+                    true
+                );
             }
 
             if (!$can_transition) {
@@ -154,8 +118,6 @@ class BANK_TRANSFER_PAYMENT_ENGINE
                     );
                 }
 
-            } elseif ($new_state === 'pending' && $current_state === 'pending') {
-                // Nothing happened; keep the timeline readable.
             } else {
 
                 self::push_timeline_event(
@@ -238,7 +200,8 @@ class BANK_TRANSFER_PAYMENT_ENGINE
         // it must be allowed through again.
         if (
             $last_lock === $state_lock_key &&
-            !($state === 'success' && $order->has_status(['pending', 'on-hold', 'failed', 'cancelled', 'checkout-draft']))
+            !($state === 'success' && $order->has_status(['pending', 'on-hold', 'failed', 'cancelled', 'checkout-draft'])) &&
+            $state !== 'returned'
         ) {
             return;
         }
@@ -247,32 +210,41 @@ class BANK_TRANSFER_PAYMENT_ENGINE
 
         $wc_status = match ($state) {
             'success'    => self::get_success_wc_status(),
-            'processing' => 'on-hold',
+            'returned'   => 'on-hold',
             'failed'     => 'failed',
             'cancelled'  => 'cancelled',
             'expired'    => 'failed',
-            'returned'   => BANK_TRANSFER_RETURNED_STATUS,
             default      => null
         };
 
         if ($wc_status) {
             if ($state === 'success') {
-                self::complete_payment($order, $wc_status, $payment_token);
-            } elseif ($state === 'processing') {
-                /*
-                 * BK-03: the customer authorised the debit; the money is on its
-                 * way for 1-5 business days. on-hold keeps the stock reserved and
-                 * takes the order out of WooCommerce's unpaid-order cancellation
-                 * and the customer's cancel link.
-                 */
-                if ($order->has_status(['pending', 'failed', 'cancelled', 'checkout-draft'])) {
-                    $order->update_status(
-                        'on-hold',
-                        __('Bank transfer authorised by the customer; the ACH debit is in flight. The order is on hold until RT confirms the funds settled.', 'bank-transfer-payment-gateway')
-                    );
+                // payment_complete() records the transaction id and paid date,
+                // reduces stock and moves the order to processing/completed the
+                // WooCommerce way. Then honour the configured success status.
+                $order->payment_complete($payment_token);
+                if ($order->get_status() !== $wc_status) {
+                    $order->update_status($wc_status, '');
                 }
             } elseif ($state === 'returned') {
-                self::apply_return($order, $payload);
+                $reason = !empty($payload['reason']) ? $payload['reason'] : (!empty($payload['return_reason']) ? $payload['return_reason'] : 'ACH Return / Reversal');
+                $note = sprintf(
+                    /* translators: %s: return reason */
+                    __('ACH Payment Returned / Reversed by bank (%s). Order moved to on-hold. Attention required.', 'bank-transfer-payment-gateway'),
+                    esc_html($reason)
+                );
+                $order->update_status('on-hold', $note);
+                $order->update_meta_data('_bank_transfer_returned', 'yes');
+                $order->update_meta_data('_bank_transfer_returned_reason', sanitize_text_field($reason));
+                $order->update_meta_data('_bank_transfer_returned_time', current_time('mysql'));
+
+                Bank_Transfer_Payment_Gateway_Logger::warning('ACH Payment Returned / Reversed for Order #' . $order_id, [
+                    'order_id'      => $order_id,
+                    'payment_token' => $payment_token,
+                    'reason'        => $reason,
+                ]);
+
+                do_action('bank_transfer_payment_returned', $order, $payload);
             } else {
                 $order->update_status($wc_status, '');
             }
@@ -282,7 +254,7 @@ class BANK_TRANSFER_PAYMENT_ENGINE
         $order->update_meta_data('_bank_transfer_last_event', $event_type);
         $order->update_meta_data('_bank_transfer_last_event_time', current_time('mysql'));
 
-        if (!empty($payment_token) && $state !== 'returned') {
+        if (!empty($payment_token)) {
             $order->update_meta_data('_bank_transfer_pay_id', $payment_token);
         }
 
@@ -293,106 +265,6 @@ class BANK_TRANSFER_PAYMENT_ENGINE
         }
 
         $order->save();
-    }
-
-    /**
-     * Mark the order paid.
-     *
-     * BK-18: a sandbox "success" on a production site must not put a real
-     * order into fulfilment. The order is parked on-hold with a note instead
-     * of processing/completed, and stock is not reduced a second time.
-     */
-    private static function complete_payment($order, $wc_status, $payment_token)
-    {
-        if ($order->get_meta('_is_test_order') && bank_transfer_is_production_environment()) {
-            $order->update_status(
-                'on-hold',
-                __('SANDBOX test payment reported as successful. No real funds were received. This site is configured as a production site, so the order was placed on hold instead of being marked paid.', 'bank-transfer-payment-gateway')
-            );
-            $order->update_meta_data('_bank_transfer_sandbox_success_held', 'yes');
-            return;
-        }
-
-        // payment_complete() records the transaction id and paid date,
-        // reduces stock and moves the order to processing/completed the
-        // WooCommerce way. Then honour the configured success status.
-        $order->payment_complete($payment_token);
-        if ($order->get_status() !== $wc_status) {
-            $order->update_status($wc_status, '');
-        }
-    }
-
-    /**
-     * BK-01: the bank sent a settled debit back. Record the code, move the
-     * order to "Payment returned" and tell the shop owner.
-     */
-    private static function apply_return($order, $payload)
-    {
-        $return_code = sanitize_text_field((string) ($payload['return_code'] ?? ''));
-        $reason      = sanitize_text_field((string) ($payload['failure_reason'] ?? ''));
-        $token       = sanitize_text_field((string) ($payload['payment_token'] ?? ''));
-
-        $detail = $return_code !== '' ? sprintf(' (%s)', $return_code) : '';
-        $note   = sprintf(
-            /* translators: 1: return code in parentheses or empty, 2: payment id */
-            __('The bank returned / reversed the settled payment%1$s for payment ID %2$s. The funds are no longer in your account. Review the order before fulfilling or shipping it.', 'bank-transfer-payment-gateway'),
-            $detail,
-            $token
-        );
-        if ($reason !== '') {
-            $note .= ' ' . $reason;
-        }
-
-        $order->update_meta_data('_bank_transfer_payment_returned', 'yes');
-        $order->update_meta_data('_bank_transfer_return_code', $return_code);
-        $order->update_meta_data('_bank_transfer_returned_at', current_time('mysql'));
-        $order->update_status(BANK_TRANSFER_RETURNED_STATUS, '');
-
-        bank_transfer_notify_admin(
-            sprintf(
-                /* translators: %s: order number */
-                __('Bank transfer payment returned for order #%s', 'bank-transfer-payment-gateway'),
-                $order->get_order_number()
-            ),
-            $note,
-            $order
-        );
-    }
-
-    /**
-     * BK-04: a settled payment arrived for an order that is already paid under
-     * another payment id. Never a second payment_complete(); flag it.
-     */
-    private static function flag_duplicate_payment($order, $token, $event_type)
-    {
-        $flagged = $order->get_meta('_bank_transfer_duplicate_payments');
-        $flagged = is_array($flagged) ? array_values(array_filter($flagged, 'is_string')) : [];
-        if (in_array($token, $flagged, true)) {
-            return;
-        }
-        $flagged[] = $token;
-        $order->update_meta_data('_bank_transfer_duplicate_payments', $flagged);
-        $order->save();
-
-        Bank_Transfer_Payment_Gateway_Logger::warning('Duplicate settled payment flagged for an already paid order.', [
-            'order_id'   => $order->get_id(),
-            'event_type' => $event_type,
-        ]);
-
-        bank_transfer_notify_admin(
-            sprintf(
-                /* translators: %s: order number */
-                __('Duplicate bank transfer payment on order #%s', 'bank-transfer-payment-gateway'),
-                $order->get_order_number()
-            ),
-            sprintf(
-                /* translators: 1: payment id of the duplicate, 2: payment id the order was paid with */
-                __('RT reports a second settled payment (payment ID %1$s) for this order, which was already paid with payment ID %2$s. The order was NOT changed. The customer has paid twice; refund the duplicate from your RT dashboard.', 'bank-transfer-payment-gateway'),
-                $token,
-                (string) $order->get_meta('_bank_transfer_pay_id')
-            ),
-            $order
-        );
     }
 
     private static function get_timeline($order)
@@ -589,32 +461,6 @@ class BANK_TRANSFER_PAYMENT_ENGINE
     /* =========================================================
      * STATE RESOLUTION
      * ========================================================= */
-
-    /**
-     * Map a status word from RT to an engine state.
-     *
-     * RT's contract (payment backend, wordpress/order_sync.py): "success" is
-     * sent only once the ACH debit has COMPLETED, i.e. the funds settled
-     * (BK-02). "processing" means the customer authorised the debit and it is
-     * in flight; "pending" means the link is open and nothing has happened.
-     * "returned" (with return_code) is a settled debit the bank sent back.
-     */
-    public static function map_status($status)
-    {
-        $status = is_string($status) && $status !== '' ? strtolower(trim($status)) : null;
-
-        return match ($status) {
-            'success', 'paid', 'completed', 'settled', 'succeeded'            => 'success',
-            'failed', 'rejected', 'declined'                                   => 'failed',
-            'cancelled', 'canceled'                                            => 'cancelled',
-            'expired'                                                          => 'expired',
-            'processing', 'submitted', 'submitting', 'authorized', 'authorised', 'in_flight', 'in-flight' => 'processing',
-            'pending', 'initiated', 'created', 'open', 'awaiting'              => 'pending',
-            'returned', 'reversed', 'reversal', 'nsf', 'chargeback', 'charged_back', 'disputed', 'dispute', 'refunded', 'refund' => 'returned',
-            default                                                            => null
-        };
-    }
-
     private static function resolve_state($payload)
     {
         $status = $payload['status']
@@ -623,7 +469,17 @@ class BANK_TRANSFER_PAYMENT_ENGINE
             ?? $payload['order_status']
             ?? null;
 
-        return self::map_status($status);
+        $status = is_string($status) && $status !== '' ? strtolower(trim($status)) : null;
+
+        return match ($status) {
+            'success', 'paid', 'completed', 'settled', 'succeeded' => 'success',
+            'returned', 'reversed', 'nsf', 'chargeback', 'disputed', 'dispute', 'refunded' => 'returned',
+            'failed'                        => 'failed',
+            'cancelled', 'canceled'        => 'cancelled',
+            'expired'                      => 'expired',
+            'pending', 'processing', 'submitted', 'authorized' => 'processing',
+            default                        => null
+        };
     }
 
     /* =========================================================
@@ -634,7 +490,7 @@ class BANK_TRANSFER_PAYMENT_ENGINE
         return match ($state) {
             'completed' => 'success',
             'canceled'  => 'cancelled',
-            BANK_TRANSFER_RETURNED_STATUS => 'returned',
+            'reversed', 'nsf', 'chargeback', 'disputed', 'refunded' => 'returned',
             default     => $state
         };
     }
@@ -644,22 +500,21 @@ class BANK_TRANSFER_PAYMENT_ENGINE
      * ========================================================= */
     private static function can_transition($from, $to)
     {
-        if ($from === 'success') return false;
+        if ($from === 'success') return $to === 'returned';
         if ($from === $to) return true;
 
         // 'expired' and 'cancelled' are reported by the RT backend webhook once
-        // a link dies unpaid or the payer abandons an open attempt. A bank
-        // transfer can still settle after the attempt was closed on the portal,
-        // so 'success' stays reachable from every non-final state (handle_event
-        // enforces the same rule). 'processing' (debit in flight) is reachable
-        // from every open or closed-but-retried state; 'returned' only follows
-        // 'success' (handle_event).
+        // a link dies unpaid or the payer abandons an open attempt. 'processing'
+        // here also covers a backend 'pending' attempt (see resolve_state), so
+        // both may legitimately follow it. A bank transfer can still settle after
+        // the attempt was closed on the portal, so 'success' stays reachable from
+        // every non-final state (handle_event enforces the same rule).
         $map = [
-            'pending'        => ['pending', 'cancelled', 'processing', 'success', 'failed', 'expired', 'on-hold'],
-            'on-hold'        => ['pending', 'cancelled', 'processing', 'success', 'failed', 'expired', 'on-hold'],
-            'checkout-draft' => ['pending', 'cancelled', 'processing', 'success', 'failed', 'expired', 'on-hold'],
+            'pending'        => ['pending', 'cancelled', 'processing', 'success', 'failed', 'expired', 'on-hold', 'returned'],
+            'on-hold'        => ['pending', 'cancelled', 'processing', 'success', 'failed', 'expired', 'on-hold', 'returned'],
+            'checkout-draft' => ['pending', 'cancelled', 'processing', 'success', 'failed', 'expired', 'on-hold', 'returned'],
             'failed'         => ['failed', 'success', 'processing', 'cancelled', 'expired', 'pending'],
-            'processing'     => ['processing', 'success', 'failed', 'cancelled', 'expired'],
+            'processing'     => ['processing', 'success', 'failed', 'cancelled', 'expired', 'on-hold', 'returned'],
             'cancelled'      => ['cancelled', 'success', 'processing', 'pending'],
             'expired'        => ['expired', 'success', 'processing', 'pending'],
             'returned'       => ['returned'],
@@ -681,10 +536,6 @@ class BANK_TRANSFER_PAYMENT_ENGINE
             return 'cancelled';
         }
 
-        if ($wc_status === BANK_TRANSFER_RETURNED_STATUS) {
-            return 'returned';
-        }
-
         $meta_state = $order->get_meta('_bank_transfer_state');
         if (!empty($meta_state)) {
             return $meta_state;
@@ -695,20 +546,12 @@ class BANK_TRANSFER_PAYMENT_ENGINE
         return !empty($wc_status) ? $wc_status : 'pending';
     }
 
-    /**
-     * Whether the order's ACH debit is in flight (authorised, not settled).
-     */
-    public static function is_in_flight($order)
-    {
-        return $order instanceof WC_Order && self::normalize_state(self::get_state($order)) === 'processing';
-    }
-
     /* =========================================================
      * SUCCESS STATUS
      * ========================================================= */
     private static function get_success_wc_status()
     {
-        $settings = bank_transfer_get_settings();
+        $settings = get_option('woocommerce_bank_transfer_settings', []);
         $status = $settings['order_status'] ?? 'processing';
 
         return in_array($status, ['processing','completed'], true)
@@ -762,7 +605,15 @@ class BANK_TRANSFER_PAYMENT_ENGINE
 
         // 2. SAFETY: API status (current response)
         if (!empty($api_status) && is_string($api_status)) {
-            $mapped = self::map_status($api_status);
+            $mapped = match (strtolower(trim($api_status))) {
+                'success', 'paid', 'completed', 'settled', 'succeeded' => 'success',
+                'returned', 'reversed', 'nsf', 'chargeback', 'disputed', 'dispute', 'refunded' => 'returned',
+                'failed' => 'failed',
+                'cancelled', 'canceled' => 'cancelled',
+                'expired' => 'expired',
+                'processing', 'pending', 'submitted', 'authorized' => 'processing',
+                default => null
+            };
 
             if ($mapped) {
                 return $mapped;

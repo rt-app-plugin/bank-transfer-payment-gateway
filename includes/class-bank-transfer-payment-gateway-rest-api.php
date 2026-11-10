@@ -3,25 +3,10 @@ if (!defined('ABSPATH')) {
 	exit; // Exit if accessed directly.
 }
 
-require_once plugin_dir_path(__FILE__) . 'config.php';
-require_once plugin_dir_path(__FILE__) . 'bank-transfer-payment-gateway-utils.php';
 require_once plugin_dir_path(__FILE__) . 'class-bank-transfer-payment-state-engine.php';
 
 class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 {
-	/** Webhook timestamps older than this are refused (seconds). */
-	const WEBHOOK_MAX_SKEW = 300;
-
-	/** How long a seen signature is remembered for replay detection (seconds). */
-	const WEBHOOK_REPLAY_TTL = 900;
-
-	/**
-	 * Namespaces the webhook / return route answers on. The first is the one
-	 * new payment links are issued with (BK-13); the others are the pre-1.0.2
-	 * names kept so links already handed to RT keep working.
-	 */
-	const NAMESPACES = [BANK_TRANSFER_REST_NAMESPACE, 'bank-transfer/v1', 'bank_transfer/v1'];
-
 	private $logger;
 	private static $instance = null;
 
@@ -38,16 +23,16 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 		// Initialize the logger
 		$this->logger = wc_get_logger();
 
-		// BT-13: Only add CORS headers for this plugin's routes without breaking global WordPress REST handling.
-		// Match strictly on the resolved REST route, anchored to our namespaces. Never fall back to REQUEST_URI:
+		// BT-13: Only add CORS headers for bank-transfer/v1 routes without breaking global WordPress REST handling.
+		// Match strictly on the resolved REST route, anchored to our namespace. Never fall back to REQUEST_URI:
 		// a substring match on it lets /wp-json/anything?x=bank-transfer/v1 receive our headers and the OPTIONS exit.
 		add_filter('rest_pre_serve_request', function ($value, $result, $request) {
 			$route = ($request instanceof WP_REST_Request) ? (string) $request->get_route() : '';
 
-			if ($route !== '' && preg_match('#^/(rt-bank-transfer|bank[-_]transfer)/v1(?:/|$)#', $route)) {
+			if ($route !== '' && preg_match('#^/bank[-_]transfer/v1(?:/|$)#', $route)) {
 				header('Access-Control-Allow-Origin: ' . BANK_TRANSFER_BASE_URL);
 				header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
-				header('Access-Control-Allow-Headers: Authorization, Content-Type, X-WP-Nonce, X-Signature, X-Timestamp, User-Agent, Accept');
+				header('Access-Control-Allow-Headers: Authorization, Content-Type, X-WP-Nonce, X-Signature, X-Timestamp, X-API-Key, User-Agent, Accept');
 
 				$request_method = filter_input(INPUT_SERVER, 'REQUEST_METHOD', FILTER_SANITIZE_FULL_SPECIAL_CHARS);
 				$request_method = $request_method ? strtoupper($request_method) : '';
@@ -65,78 +50,119 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 	public function bank_transfer_register_routes()
 	{
 		add_action('rest_api_init', function () {
-			foreach (self::NAMESPACES as $namespace) {
-				register_rest_route($namespace, '/data', array(
-					'methods'             => ['GET', 'POST'],
-					'callback'            => array($this, 'bank_transfer_handle_api_request'),
-					'permission_callback' => '__return_true',
-				));
-			}
+			register_rest_route('bank-transfer/v1', '/data', array(
+				'methods'             => ['GET', 'POST'],
+				'callback'            => array($this, 'bank_transfer_handle_api_request'),
+				'permission_callback' => '__return_true',
+			));
+			register_rest_route('bank_transfer/v1', '/data', array(
+				'methods'             => ['GET', 'POST'],
+				'callback'            => array($this, 'bank_transfer_handle_api_request'),
+				'permission_callback' => '__return_true',
+			));
 		});
 	}
 
 	/**
-	 * BK-07: a webhook is accepted only with a valid HMAC-SHA256 signature of
-	 * "<X-Timestamp>.<raw body>" made with the secret key of the account that
-	 * created the order's payment, with the timestamp within WEBHOOK_MAX_SKEW
-	 * and the signature not seen before. No other credential is accepted: a
-	 * raw secret in a header, bearer or query string is refused.
-	 *
-	 * @return true|WP_Error
+	 * BT-05: Verifies webhook authentication using HMAC-SHA256 signature or current-mode secret key.
+	 * Never accepts public keys or sandbox keys in live mode.
 	 */
 	private function bank_transfer_verify_webhook(WP_REST_Request $request, $order)
 	{
+		$settings   = get_option('woocommerce_bank_transfer_settings', []);
+		$is_sandbox = isset($settings['sandbox']) && $settings['sandbox'] === 'yes';
+
+		$accounts_data = get_option('woocommerce_bank_transfer_payment_gateway_accounts', []);
+		if (is_string($accounts_data)) {
+			$accounts_data = maybe_unserialize($accounts_data);
+		}
+		if (!is_array($accounts_data)) {
+			$accounts_data = [];
+		}
+		if (isset($accounts_data['live_secret_key']) || isset($accounts_data['sandbox_secret_key'])) {
+			$accounts_data = [$accounts_data];
+		}
+
+		if (empty($accounts_data)) {
+			Bank_Transfer_Payment_Gateway_Logger::warning('No account data found for webhook auth', ['source' => 'bank-transfer-payment-gateway']);
+			return false;
+		}
+
 		if (!$order || !is_a($order, 'WC_Order')) {
-			return new WP_Error('no_order', 'Authentication failed.');
+			return false;
 		}
 
-		$account = bank_transfer_get_order_account($order);
-		if ($account === null || empty($account['secret_key'])) {
-			Bank_Transfer_Payment_Gateway_Logger::warning('Webhook rejected: no configured account matches the order public key', ['order_id' => $order->get_id()]);
-			return new WP_Error('no_account', 'Authentication failed.');
+		$order_public_key = $order->get_meta('_bank_transfer_public_key');
+		if (empty($order_public_key)) {
+			Bank_Transfer_Payment_Gateway_Logger::warning('Webhook rejected: order has no public key', ['order_id' => $order->get_id()]);
+			return false;
 		}
 
-		// The order was created under one mode (live or sandbox); its public key
-		// only exists in that mode's key pair, so the mode is fixed by the order,
-		// not by the current sandbox setting (BK-18).
-		$secret = trim(trim((string) $account['secret_key']), '"\'');
+		$valid_secrets = [];
 
-		$sig_header       = trim((string) $request->get_header('x-signature'));
-		$timestamp_header = trim((string) $request->get_header('x-timestamp'));
+		foreach ($accounts_data as $account) {
+			if (!is_array($account)) {
+				continue;
+			}
+			$pub = $is_sandbox ? ($account['sandbox_public_key'] ?? '') : ($account['live_public_key'] ?? '');
+			$sec = $is_sandbox ? ($account['sandbox_secret_key'] ?? '') : ($account['live_secret_key'] ?? '');
+			$sec = trim(trim((string) $sec), '"\'');
 
-		if ($sig_header === '' || $timestamp_header === '') {
-			Bank_Transfer_Payment_Gateway_Logger::warning('Webhook rejected: X-Signature / X-Timestamp headers required', ['order_id' => $order->get_id()]);
-			return new WP_Error('signature_required', 'Authentication failed.');
+			if (empty($sec)) {
+				continue;
+			}
+
+			if ($pub === $order_public_key) {
+				$valid_secrets = [$sec];
+				break;
+			}
+		}
+
+		if (empty($valid_secrets)) {
+			Bank_Transfer_Payment_Gateway_Logger::warning('Webhook rejected: no matching account found for order public key', ['order_id' => $order->get_id()]);
+			return false;
+		}
+
+		// BK-07: Mandatory HMAC signature verification with replay protection
+		$sig_header       = (string) $request->get_header('x-signature');
+		$timestamp_header = (string) $request->get_header('x-timestamp');
+
+		if (empty($sig_header) || empty($timestamp_header)) {
+			Bank_Transfer_Payment_Gateway_Logger::warning('Webhook rejected: missing HMAC signature headers');
+			return false;
 		}
 
 		// X-Timestamp must be a strict unsigned digit string (rejects "123abc", signs, floats, exponents).
+		$timestamp_header = trim($timestamp_header);
 		if (!ctype_digit($timestamp_header) || strlen($timestamp_header) > 12) {
 			Bank_Transfer_Payment_Gateway_Logger::warning('Webhook timestamp malformed');
-			return new WP_Error('timestamp_malformed', 'Authentication failed.');
+			return false;
 		}
 
 		$timestamp_int = (int) $timestamp_header;
-		if (abs(time() - $timestamp_int) > self::WEBHOOK_MAX_SKEW) {
+		if (abs(time() - $timestamp_int) > 300) {
 			Bank_Transfer_Payment_Gateway_Logger::warning('Webhook timestamp expired', ['timestamp' => $timestamp_int]);
-			return new WP_Error('timestamp_expired', 'Authentication failed.');
+			return false;
 		}
 
-		$raw_body     = $request->get_body();
-		$expected_sig = hash_hmac('sha256', $timestamp_header . '.' . $raw_body, $secret);
-		if (!hash_equals($expected_sig, strtolower($sig_header))) {
-			Bank_Transfer_Payment_Gateway_Logger::warning('Webhook HMAC signature mismatch', ['order_id' => $order->get_id()]);
-			return new WP_Error('signature_mismatch', 'Authentication failed.');
+		// Replay protection within the 300-second window
+		$replay_cache_key = 'bank_transfer_webhook_sig_' . md5($sig_header);
+		if (get_transient($replay_cache_key) !== false) {
+			Bank_Transfer_Payment_Gateway_Logger::warning('Webhook rejected: replay detected', ['signature' => substr($sig_header, 0, 10) . '...']);
+			return false;
 		}
 
-		// Replay store: the same signature is only ever accepted once.
-		$replay_key = 'bt_wh_' . substr(hash('sha256', $order->get_id() . '|' . $sig_header), 0, 40);
-		if (get_transient($replay_key) !== false) {
-			Bank_Transfer_Payment_Gateway_Logger::warning('Webhook replay ignored', ['order_id' => $order->get_id()]);
-			return new WP_Error('replay', 'Duplicate delivery.');
+		$raw_body = $request->get_body();
+		foreach ($valid_secrets as $secret) {
+			$expected_sig = hash_hmac('sha256', $timestamp_header . '.' . $raw_body, $secret);
+			if (hash_equals($expected_sig, $sig_header)) {
+				set_transient($replay_cache_key, 1, 300);
+				return true;
+			}
 		}
-		set_transient($replay_key, 1, self::WEBHOOK_REPLAY_TTL);
 
-		return true;
+		Bank_Transfer_Payment_Gateway_Logger::warning('Webhook HMAC signature mismatch');
+		return false;
 	}
 
 	/**
@@ -148,21 +174,47 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 	public function bank_transfer_handle_api_request(WP_REST_Request $request)
 	{
 		$method      = strtoupper($request->get_method());
+		$params      = $request->get_params();
 		$log_context = ['source' => 'bank-transfer-payment-gateway'];
+
+		$data = isset($params['api_data']) && is_array($params['api_data']) ? $params['api_data'] : $params;
+
+		$order_id         = intval($data['order_id'] ?? ($params['order_id'] ?? 0));
+		// The backend has used more than one field name for the same two values;
+		// accept them all so a status push is never dropped on a rename. A bare
+		// top-level "status" is deliberately ignored (it describes the call).
+		$api_order_status = sanitize_text_field((string) (
+			$data['order_status']
+			?? ($data['payment_status']
+			?? ($data['transaction_status']
+			?? ($params['order_status']
+			?? ($params['payment_status'] ?? ''))))
+		));
+		$api_order_status = strtolower(trim(trim($api_order_status), '"\''));
+		if ($api_order_status === '' && isset($data['settled']) && filter_var($data['settled'], FILTER_VALIDATE_BOOLEAN)) {
+			$api_order_status = 'success';
+		}
+
+		$pay_id = sanitize_text_field((string) (
+			$data['pay_id']
+			?? ($data['uuid']
+			?? ($data['payment_token']
+			?? ($params['pay_id']
+			?? ($params['uuid'] ?? ''))))
+		));
+		$pay_id = trim(trim($pay_id), '"\'');
+
+		Bank_Transfer_Payment_Gateway_Logger::info(
+			"Bank Transfer API HIT | Method: {$method} | Order #{$order_id} | Status: {$api_order_status} | Pay ID: {$pay_id}",
+			$log_context
+		);
 
 		// -------------------------
 		// 1. GET (RETURN / REDIRECT ONLY) - BT-01 & BT-02
 		// -------------------------
 		if ($method === 'GET') {
-			$params       = $request->get_query_params();
-			$order_id     = intval($params['order_id'] ?? 0);
-			$provided_key = sanitize_text_field($params['key'] ?? ($params['order_key'] ?? ''));
+			$provided_key = sanitize_text_field($data['key'] ?? ($params['key'] ?? ($data['order_key'] ?? ($params['order_key'] ?? ''))));
 			$order        = ($order_id > 0) ? wc_get_order($order_id) : false;
-
-			Bank_Transfer_Payment_Gateway_Logger::info(
-				"Bank Transfer API HIT | Method: {$method} | Order #{$order_id}",
-				$log_context
-			);
 
 			// Verify order existence, order key, and payment method uniformly to prevent ID enumeration
 			if (
@@ -170,7 +222,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 				!$order ||
 				empty($provided_key) ||
 				!hash_equals($order->get_order_key(), $provided_key) ||
-				!bank_transfer_is_gateway_order($order)
+				$order->get_payment_method() !== 'bank_transfer'
 			) {
 				return new WP_REST_Response([
 					'success' => false,
@@ -211,130 +263,141 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 			], 405);
 		}
 
-		// Only the signed body is read. Query-string and form parameters are
-		// never merged in: they are not covered by the signature.
-		$raw_body = $request->get_body();
-		$body     = json_decode($raw_body, true);
-		if (!is_array($body)) {
+		$order = ($order_id > 0) ? wc_get_order($order_id) : false;
+		if (
+			$order_id <= 0 ||
+			!$order ||
+			$order->get_payment_method() !== 'bank_transfer' ||
+			!$this->bank_transfer_verify_webhook($request, $order)
+		) {
+			return new WP_REST_Response([
+				'success'    => false,
+				'error_code' => 'INVALID_API_KEY',
+				'message'    => 'Authentication failed.'
+			], 401);
+		}
+
+		// BT-05: Mandatory check that pay_id matches a payment id this order is
+		// known under (order meta, active id, or the stored payment link row).
+		// An order with no recorded id at all (older order, create-link response
+		// without pay_id) adopts the webhook's id: the request is authenticated
+		// with the order's own account secret and amount/currency are verified below.
+		if (empty($pay_id)) {
+			Bank_Transfer_Payment_Gateway_Logger::warning("Webhook missing Pay ID for Order #{$order_id}");
 			return new WP_REST_Response([
 				'success' => false,
-				'message' => 'Invalid payload'
+				'message' => 'Payment ID required.'
 			], 400);
 		}
 
-		$data = isset($body['api_data']) && is_array($body['api_data']) ? $body['api_data'] : $body;
-
-		$order_id = intval($data['order_id'] ?? 0);
-		// The backend has used more than one field name for the same two values;
-		// accept them all so a status push is never dropped on a rename. A bare
-		// top-level "status" is deliberately ignored (it describes the call).
-		$api_order_status = sanitize_text_field((string) (
-			$data['order_status']
-			?? ($data['payment_status']
-			?? ($data['transaction_status'] ?? ''))
-		));
-		$api_order_status = strtolower(trim(trim($api_order_status), '"\''));
-		if ($api_order_status === '' && isset($data['settled']) && filter_var($data['settled'], FILTER_VALIDATE_BOOLEAN)) {
-			$api_order_status = 'success';
-		}
-
-		$pay_id = sanitize_text_field((string) (
-			$data['pay_id']
-			?? ($data['uuid']
-			?? ($data['payment_token'] ?? ''))
-		));
-		$pay_id = trim(trim($pay_id), '"\'');
-
-		Bank_Transfer_Payment_Gateway_Logger::info(
-			"Bank Transfer API HIT | Method: {$method} | Order #{$order_id} | Status: {$api_order_status} | Pay ID: {$pay_id}",
-			$log_context
-		);
-
-		$order = ($order_id > 0) ? wc_get_order($order_id) : false;
-		if ($order_id <= 0 || !$order || !bank_transfer_is_gateway_order($order)) {
-			return new WP_REST_Response([
-				'success'    => false,
-				'error_code' => 'INVALID_API_KEY',
-				'message'    => 'Authentication failed.'
-			], 401);
-		}
-
-		$verified = $this->bank_transfer_verify_webhook($request, $order);
-		if (is_wp_error($verified)) {
-			if ($verified->get_error_code() === 'replay') {
-				// Already processed once; acknowledge without acting on it.
-				return new WP_REST_Response([
-					'success' => false,
-					'message' => 'Duplicate delivery ignored.',
-					'state'   => BANK_TRANSFER_PAYMENT_ENGINE::resolve_final_state($order, $api_order_status),
-				], 200);
-			}
-			return new WP_REST_Response([
-				'success'    => false,
-				'error_code' => 'INVALID_API_KEY',
-				'message'    => 'Authentication failed.'
-			], 401);
-		}
-
-		// -------------------------
-		// 3. BK-05: ONE STRICT CHECK (payment id, exact amount, currency, order)
-		// -------------------------
 		$loader    = class_exists('BANK_TRANSFER_PAYMENT_GATEWAY_Loader') ? BANK_TRANSFER_PAYMENT_GATEWAY_Loader::get_instance() : null;
 		$known_ids = $loader
 			? $loader->bank_transfer_known_order_pay_ids($order)
 			: array_values(array_filter([(string) $order->get_meta('_bank_transfer_pay_id')]));
 
-		$claim = bank_transfer_verify_payment_claim($order, $data, $pay_id, $known_ids);
-		if (is_wp_error($claim)) {
-			Bank_Transfer_Payment_Gateway_Logger::warning("Webhook refused for Order #{$order_id}: " . $claim->get_error_message(), [
-				'code'     => $claim->get_error_code(),
+		$id_matches = false;
+		foreach ($known_ids as $known_id) {
+			if (hash_equals((string) $known_id, $pay_id)) {
+				$id_matches = true;
+				break;
+			}
+		}
+
+		if (!$id_matches && !empty($known_ids)) {
+			Bank_Transfer_Payment_Gateway_Logger::warning("Webhook Pay ID mismatch for Order #{$order_id}", [
+				'stored'   => $known_ids,
 				'received' => $pay_id,
 			]);
 			return new WP_REST_Response([
 				'success' => false,
-				'message' => $claim->get_error_message(),
+				'message' => 'Payment ID mismatch.'
 			], 400);
 		}
 
-		if ($api_order_status === '') {
+		if (empty($known_ids)) {
+			Bank_Transfer_Payment_Gateway_Logger::info("Webhook supplied Pay ID for Order #{$order_id}, which had none recorded; adopting it.", [
+				'received' => $pay_id,
+			]);
+			$order->update_meta_data('_bank_transfer_pay_id', $pay_id);
+			$order->save();
+		}
+
+
+		// BT-05: Mandatory amount check
+		$raw_amount = $data['amount'] ?? ($data['total_amount'] ?? null);
+		if ($raw_amount === null || !is_numeric($raw_amount)) {
 			return new WP_REST_Response([
 				'success' => false,
-				'message' => 'Status required.'
-			], 422);
+				'message' => 'Amount required.'
+			], 400);
+		}
+
+		$webhook_amount = floatval($raw_amount);
+		$order_amount   = floatval($order->get_total());
+		if (abs($webhook_amount - $order_amount) > 0.01) {
+			Bank_Transfer_Payment_Gateway_Logger::warning("Webhook amount mismatch for Order #{$order_id}", [
+				'order_amount'   => $order_amount,
+				'webhook_amount' => $webhook_amount,
+			]);
+			return new WP_REST_Response([
+				'success' => false,
+				'message' => 'Amount mismatch.'
+			], 400);
+		}
+
+		// BT-05: Mandatory currency check
+		$curr_code = $data['curr_code'] ?? ($data['currency'] ?? '');
+		if (empty($curr_code)) {
+			return new WP_REST_Response([
+				'success' => false,
+				'message' => 'Currency required.'
+			], 400);
+		}
+
+		$webhook_curr = strtoupper(trim(sanitize_text_field($curr_code)));
+		$order_curr   = strtoupper(trim($order->get_currency()));
+		if ($webhook_curr !== $order_curr) {
+			Bank_Transfer_Payment_Gateway_Logger::warning("Webhook currency mismatch for Order #{$order_id}", [
+				'order_currency'   => $order_curr,
+				'webhook_currency' => $webhook_curr,
+			]);
+			return new WP_REST_Response([
+				'success' => false,
+				'message' => 'Currency mismatch.'
+			], 400);
 		}
 
 		// -------------------------
-		// 4. ENGINE CALL (WEBHOOK ONLY)
+		// 3. ENGINE CALL (WEBHOOK ONLY)
 		// -------------------------
-		$result = BANK_TRANSFER_PAYMENT_ENGINE::handle_event(
-			$order_id,
-			'webhook_update',
-			[
-				'status'         => $api_order_status,
-				'payment_token'  => $pay_id,
-				'source'         => 'Webhook',
-				'return_code'    => sanitize_text_field((string) ($data['return_code'] ?? '')),
-				'failure_reason' => sanitize_text_field((string) ($data['failure_reason'] ?? '')),
-			]
-		);
+		$result = null;
+		if (!empty($api_order_status)) {
+			$result = BANK_TRANSFER_PAYMENT_ENGINE::handle_event(
+				$order_id,
+				'webhook_update',
+				[
+					'status'        => $api_order_status,
+					'payment_token' => $pay_id,
+					'source'        => 'Webhook'
+				]
+			);
 
-		Bank_Transfer_Payment_Gateway_Logger::info(
-			"Bank Transfer ENGINE RESULT | Order #{$order_id} | " . wp_json_encode($result),
-			$log_context
-		);
+			Bank_Transfer_Payment_Gateway_Logger::info(
+				"Bank Transfer ENGINE RESULT | Order #{$order_id} | " . wp_json_encode($result),
+				$log_context
+			);
 
-		$reason = is_array($result) ? ($result['reason'] ?? null) : null;
-
-		// BT-39: Return 423 Locked when lock cannot be acquired so API retries
-		if ($reason === 'locked_skip') {
-			return new WP_REST_Response([
-				'success' => false,
-				'message' => 'Order is currently locked, please retry.'
-			], 423);
+			// BT-39: Return 423 Locked when lock cannot be acquired so API retries
+			if (!empty($result['reason']) && $result['reason'] === 'locked_skip') {
+				return new WP_REST_Response([
+					'success' => false,
+					'message' => 'Order is currently locked, please retry.'
+				], 423);
+			}
 		}
 
 		// -------------------------
-		// 5. RESOLVE FINAL STATE
+		// 4. RESOLVE FINAL STATE
 		// -------------------------
 		$order = wc_get_order($order_id);
 		$state = BANK_TRANSFER_PAYMENT_ENGINE::resolve_final_state(
@@ -342,33 +405,34 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 			$api_order_status
 		);
 
+		if (is_array($result) && ($result['reason'] ?? '') === 'invalid_transition_blocked') {
+			return new WP_REST_Response([
+				'success'       => false,
+				'message'       => 'State transition refused.',
+				'state'         => $state,
+				'order_status'  => $order ? $order->get_status() : '',
+				'engine_reason' => $result['reason'] ?? null,
+			], 422);
+		}
+
 		$wc_status = $order->get_status();
-		if ($wc_status === 'processing' || $wc_status === 'completed') {
+		if (($wc_status === 'processing' || $wc_status === 'completed') && $state !== 'returned') {
 			$state = 'success';
 		}
 
-		$is_success = ($state === 'success');
+		$is_success = ($state === 'success' || $state === 'returned');
 		$message = match ($state) {
 			'success'    => 'Payment confirmed successfully.',
+			'returned'   => 'Payment returned or reversed.',
 			'failed'     => 'Payment failed. Please try again.',
 			'cancelled'  => 'Payment was cancelled.',
 			'processing' => 'Payment is being processed.',
 			'pending'    => 'Payment is pending.',
-			'returned'   => 'Payment was returned by the bank.',
 			default      => 'Payment status is being verified.'
 		};
 
-		// BK-17: a webhook the shop did not act on is not acknowledged with 200.
-		// 422: the status word is unknown to this plugin. 409: the transition is
-		// not allowed from the order's current state. RT records the answer.
-		$http_code = match ($reason) {
-			'no_state'                   => 422,
-			'invalid_transition_blocked' => 409,
-			default                      => ($result === false ? 400 : 200)
-		};
-
 		Bank_Transfer_Payment_Gateway_Logger::info(
-			"Bank Transfer FINAL RESPONSE | Order #{$order_id} | State: {$state} | WC: {$wc_status} | HTTP: {$http_code}",
+			"Bank Transfer FINAL RESPONSE | Order #{$order_id} | State: {$state} | WC: {$wc_status}",
 			$log_context
 		);
 
@@ -380,7 +444,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_REST_API
 			'message'       => $message,
 			'state'         => $state,
 			'order_status'  => $wc_status,
-			'engine_reason' => $reason,
-		], $http_code);
+			'engine_reason' => is_array($result) ? ($result['reason'] ?? null) : null,
+		], 200);
 	}
 }
