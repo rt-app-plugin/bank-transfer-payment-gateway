@@ -1,30 +1,30 @@
 .bank_transfer-accounts-container,
 .bank-transfer-accounts-container,
-.bytenft-accounts-container {
+.rt_bank_transfer-accounts-container {
 	max-width: 600px;
 }
 
 .bank_transfer-accounts-container .title-priority,
 .bank-transfer-accounts-container .title-priority,
-.bytenft-accounts-container .title-priority {
+.rt_bank_transfer-accounts-container .title-priority {
 	display: flex;
 }
 
 .bank_transfer-accounts-container .title-priority .account-name,
 .bank-transfer-accounts-container .title-priority .account-name,
-.bytenft-accounts-container .title-priority .account-name {
+.rt_bank_transfer-accounts-container .title-priority .account-name {
 	width: 70% !important;
 }
 
 .bank_transfer-accounts-container .title-priority .priority-name,
 .bank-transfer-accounts-container .title-priority .priority-name,
-.bytenft-accounts-container .title-priority .priority-name {
+.rt_bank_transfer-accounts-container .title-priority .priority-name {
 	width: 28% !important;
 }
 
 .bank_transfer-accounts-container .rotated,
 .bank-transfer-accounts-container .rotated,
-.bytenft-accounts-container .rotated {
+.rt_bank_transfer-accounts-container .rotated {
 	transform: rotate(180deg);
 }
 
@@ -32,18 +32,18 @@
 .bank_transfer-instructions-url:hover,
 .bank-transfer-instructions-url,
 .bank-transfer-instructions-url:hover,
-.bytenft-instructions-url,
-.bytenft-instructions-url:hover {
+.rt_bank_transfer-instructions-url,
+.rt_bank_transfer-instructions-url:hover {
 	color: #8264D7;
 }
 
 .bank_transfer-accounts-container .bank_transfer-account,
 .bank_transfer-accounts-container .bank-transfer-account,
-.bank_transfer-accounts-container .bytenft-account,
+.bank_transfer-accounts-container .rt_bank_transfer-account,
 .bank-transfer-accounts-container .bank_transfer-account,
 .bank-transfer-accounts-container .bank-transfer-account,
-.bank-transfer-accounts-container .bytenft-account,
-.bytenft-accounts-container .bytenft-account {
+.bank-transfer-accounts-container .rt_bank_transfer-account,
+.rt_bank_transfer-accounts-container .rt_bank_transfer-account {
 	margin-bottom: 14px !important;
 	border: 1px solid #C5C5C5;
 	border-radius: 7px;
@@ -52,7 +52,7 @@
 
 .bank_transfer-accounts-container .add-blog,
 .bank-transfer-accounts-container .add-blog,
-.bytenft-accounts-container .add-blog {
+.rt_bank_transfer-accounts-container .add-blog {
 	align-items: start;
 	flex-wrap: wrap;
 	margin-bottom: 10px;
@@ -64,8 +64,8 @@
 .bank_transfer-accounts-container .account-input textarea,
 .bank-transfer-accounts-container .account-input input,
 .bank-transfer-accounts-container .account-input textarea,
-.bytenft-accounts-container .account-input input,
-.bytenft-accounts-container .account-input textarea {
+.rt_bank_transfer-accounts-container .account-input input,
+.rt_bank_transfer-accounts-container .account-input textarea {
 	width: 100% !important;
 	margin-bottom: 8px !important;
 	margin-right: 8px !important;
@@ -73,7 +73,7 @@
 
 .bank_transfer-accounts-container h4,
 .bank-transfer-accounts-container h4,
-.bytenft-accounts-container h4 {
+.rt_bank_transfer-accounts-container h4 {
 	font-size: 17px !important;
 	margin-top: 0 !important;
 	margin-bottom: 0px !important;
@@ -83,7 +83,7 @@
 
 .bank_transfer-accounts-container h4 i,
 .bank-transfer-accounts-container h4 i,
-.bytenft-accounts-container h4 i {
+.rt_bank_transfer-accounts-container h4 i {
 	font-size: 13px !important;
 	margin-left: 6px !important;
 	margin-right: 6px !important;
@@ -101,21 +101,21 @@
 
 .bank_transfer-accounts-container .action-button,
 .bank-transfer-accounts-container .action-button,
-.bytenft-accounts-container .action-button {
+.rt_bank_transfer-accounts-container .action-button {
 	display: flex !important;
 	align-items: center !important;
 }
 
 .bank_transfer-accounts-container .action-button .account-status-block,
 .bank-transfer-accounts-container .action-button .account-status-block,
-.bytenft-accounts-container .action-button .account-status-block {
+.rt_bank_transfer-accounts-container .action-button .account-status-block {
 	float: none !important;
 	margin-right: 8px;
 }
 
 .bank_transfer-accounts-container .action-button button,
 .bank-transfer-accounts-container .action-button button,
-.bytenft-accounts-container .action-button button {
+.rt_bank_transfer-accounts-container .action-button button {
 	color: #6B6B6B;
 	font-size: 14px !important;
 	background: transparent;
@@ -125,7 +125,7 @@
 
 .bank_transfer-accounts-container .active-indicator,
 .bank-transfer-accounts-container .active-indicator,
-.bytenft-accounts-container .bytenft-account .active-indicator {
+.rt_bank_transfer-accounts-container .rt_bank_transfer-account .active-indicator {
 	font-size: 14px !important;
 	color: #28A745 !important;
 	background: #E7F5EB !important;
@@ -137,18 +137,18 @@
 
 .bank_transfer-accounts-container .account-input label,
 .bank-transfer-accounts-container .account-input label,
-.bytenft-accounts-container .account-input label {
+.rt_bank_transfer-accounts-container .account-input label {
 	display: block !important;
 	margin-bottom: 5px !important;
 }
 
 .bank_transfer-accounts-container .add-account-btn .bank_transfer-add-account,
 .bank_transfer-accounts-container .add-account-btn .bank-transfer-add-account,
-.bank_transfer-accounts-container .add-account-btn .bytenft-add-account,
+.bank_transfer-accounts-container .add-account-btn .rt_bank_transfer-add-account,
 .bank-transfer-accounts-container .add-account-btn .bank_transfer-add-account,
 .bank-transfer-accounts-container .add-account-btn .bank-transfer-add-account,
-.bank-transfer-accounts-container .add-account-btn .bytenft-add-account,
-.bytenft-accounts-container .add-account-btn .bytenft-add-account {
+.bank-transfer-accounts-container .add-account-btn .rt_bank_transfer-add-account,
+.rt_bank_transfer-accounts-container .add-account-btn .rt_bank_transfer-add-account {
 	border-radius: 5px;
 	background: #0A0B21;
 	color: #F5F5F5;
@@ -164,11 +164,11 @@
 
 .bank_transfer-accounts-container .add-account-btn .bank_transfer-add-account span,
 .bank_transfer-accounts-container .add-account-btn .bank-transfer-add-account span,
-.bank_transfer-accounts-container .add-account-btn .bytenft-add-account span,
+.bank_transfer-accounts-container .add-account-btn .rt_bank_transfer-add-account span,
 .bank-transfer-accounts-container .add-account-btn .bank_transfer-add-account span,
 .bank-transfer-accounts-container .add-account-btn .bank-transfer-add-account span,
-.bank-transfer-accounts-container .add-account-btn .bytenft-add-account span,
-.bytenft-accounts-container .add-account-btn .bytenft-add-account span {
+.bank-transfer-accounts-container .add-account-btn .rt_bank_transfer-add-account span,
+.rt_bank_transfer-accounts-container .add-account-btn .rt_bank_transfer-add-account span {
 	font-size: 19px;
 	line-height: 12px;
 }
@@ -179,7 +179,7 @@
 .bank-transfer-accounts-container .account-info,
 .bank-transfer-accounts-container .bank_transfer-info,
 .bank-transfer-accounts-container .bank-transfer-info,
-.bytenft-accounts-container .account-info {
+.rt_bank_transfer-accounts-container .account-info {
 	display: none;
 	margin-top: 18px !important;
 }
@@ -192,7 +192,7 @@
 .bank-transfer-accounts-container .bank-transfer-toggle-btn,
 .bank_transfer-toggle-btn,
 .bank-transfer-toggle-btn,
-.bytenft-accounts-container .account-toggle-btn {
+.rt_bank_transfer-accounts-container .account-toggle-btn {
 	color: #6B6B6B;
 	font-size: 17px !important;
 	margin-left: 8px !important;
@@ -200,7 +200,7 @@
 
 .bank_transfer-accounts-container .account-checkbox,
 .bank-transfer-accounts-container .account-checkbox,
-.bytenft-accounts-container .account-checkbox {
+.rt_bank_transfer-accounts-container .account-checkbox {
 	font-size: 14px !important;
 	display: flex !important;
 	align-items: center !important;
@@ -209,7 +209,7 @@
 
 .bank_transfer-accounts-container .account-checkbox input,
 .bank-transfer-accounts-container .account-checkbox input,
-.bytenft-accounts-container .account-checkbox input {
+.rt_bank_transfer-accounts-container .account-checkbox input {
 	width: 15px !important;
 	height: 15px !important;
 	margin-right: 5px !important;
@@ -218,7 +218,7 @@
 
 .bank_transfer-accounts-container .title-blog,
 .bank-transfer-accounts-container .title-blog,
-.bytenft-accounts-container .title-blog {
+.rt_bank_transfer-accounts-container .title-blog {
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
@@ -255,13 +255,13 @@
 
 #bank_transfer-sync-status,
 #bank-transfer-sync-status,
-#bytenft-sync-status {
+#rt_bank_transfer-sync-status {
 	padding-right: 10px;
 }
 
 .bank_transfer-sync-account,
 .bank-transfer-sync-account,
-.bytenft-sync-account {
+.rt_bank_transfer-sync-account {
 	justify-content: end;
 	align-items: center;
 	display: flex;
@@ -270,7 +270,7 @@
 
 .bank_transfer-sync-account button,
 .bank-transfer-sync-account button,
-.bytenft-sync-account button {
+.rt_bank_transfer-sync-account button {
 	border: 1px solid #8264D7 !important;
 	color: #8264D7 !important;
 	background: #8264D717 !important;
@@ -283,13 +283,13 @@
 
 .bank_transfer-sync-account .success,
 .bank-transfer-sync-account .success,
-.bytenft-sync-account .success {
+.rt_bank_transfer-sync-account .success {
 	color: #28A745 !important;
 }
 
 .bank_transfer-accounts-container input.error,
 .bank-transfer-accounts-container input.error,
-.bytenft-accounts-container input.error {
+.rt_bank_transfer-accounts-container input.error {
 	border: 1px solid #dc3545;
 	background-color: #fff0f0;
 	color: #dc3545;

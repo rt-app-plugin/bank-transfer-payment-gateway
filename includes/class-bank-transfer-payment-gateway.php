@@ -9,7 +9,7 @@ require_once plugin_dir_path(__FILE__) . 'class-bank-transfer-payment-logger.php
 
 class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 {
-	const ID = 'bank_transfer';
+	const ID = BANK_TRANSFER_GATEWAY_ID;
 
 	protected $sandbox;
 	private $base_url;
@@ -342,8 +342,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 					]
 				);
 
-				throw new Exception(
-					esc_html($normalized['error'] ?? 'Invalid phone number.')
+				throw $this->bank_transfer_checkout_exception(
+					$normalized['error'] ?? __('Invalid phone number.', 'bank-transfer-payment-gateway')
 				);
 			}
 
@@ -378,8 +378,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				]
 			);
 
-			throw new Exception(
-				'PO Box addresses are not accepted. Please enter a physical street address.'
+			throw $this->bank_transfer_checkout_exception(
+				__('PO Box addresses are not accepted. Please enter a physical street address.', 'bank-transfer-payment-gateway')
 			);
 		}
 
@@ -439,8 +439,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 					]
 				);
 
-				throw new Exception(
-					'Invalid ZIP / postal code.'
+				throw $this->bank_transfer_checkout_exception(
+					__('Invalid ZIP / postal code.', 'bank-transfer-payment-gateway')
 				);
 			}
 
@@ -457,6 +457,35 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		}
 
 		return $order;
+	}
+
+	/**
+	 * A checkout validation failure for the Store API: a RouteException is
+	 * answered as a 400 with the message; a plain Exception would be a 500.
+	 *
+	 * @param string $message
+	 * @return \Exception
+	 */
+	private function bank_transfer_checkout_exception($message) {
+		if (class_exists('\Automattic\WooCommerce\StoreApi\Exceptions\RouteException')) {
+			return new \Automattic\WooCommerce\StoreApi\Exceptions\RouteException(
+				'rt_bank_transfer_invalid_address',
+				esc_html($message),
+				400
+			);
+		}
+		return new \Exception(esc_html($message));
+	}
+
+	/**
+	 * Whether the current request is a WooCommerce Store API (block checkout) call.
+	 */
+	private function is_store_api_request() {
+		if (!defined('REST_REQUEST') || !REST_REQUEST) {
+			return false;
+		}
+		$uri = isset($_SERVER['REQUEST_URI']) ? sanitize_text_field(wp_unslash($_SERVER['REQUEST_URI'])) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		return strpos($uri, 'wc/store') !== false;
 	}
 
 	private function get_api_url($endpoint) {
@@ -528,19 +557,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			Bank_Transfer_Payment_Gateway_Logger::info('No accounts submitted in admin options.');
 		}
 
-		$existing_accounts = get_option('woocommerce_bank_transfer_payment_gateway_accounts', []);
-		if (empty($existing_accounts)) {
-			$existing_accounts = get_option('woocommerce_bytenft_payment_gateway_accounts', []);
-			if (empty($existing_accounts)) {
-				$existing_accounts = get_option('woocommerce_unified_payment_gateway_accounts', []);
-			}
-		}
-		if (is_string($existing_accounts)) {
-			$existing_accounts = maybe_unserialize($existing_accounts);
-		}
-		if (!is_array($existing_accounts)) {
-			$existing_accounts = [];
-		}
+		// BK-09: only this plugin's own accounts; never another plugin's keys.
+		$existing_accounts = bank_transfer_get_accounts();
 
 		$existing_by_id = [];
 		foreach ($existing_accounts as $idx => $existing_acc) {
@@ -669,7 +687,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		}
 
 		if (empty($errors)) {
-			update_option('woocommerce_bank_transfer_payment_gateway_accounts', $valid_accounts);
+			update_option(BANK_TRANSFER_ACCOUNTS_OPTION, $valid_accounts);
 
 			$first_account = !empty($valid_accounts) ? reset($valid_accounts) : null;
 			$public_key    = $first_account ? ($this->sandbox ? ($first_account['sandbox_public_key'] ?? '') : ($first_account['live_public_key'] ?? '')) : '';
@@ -752,7 +770,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		}
 		unset($account);
 		if ($updated) {
-			update_option('woocommerce_bank_transfer_payment_gateway_accounts', $accounts);
+			update_option(BANK_TRANSFER_ACCOUNTS_OPTION, $accounts);
 		}
 		return $accounts;
 	}
@@ -777,7 +795,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				'title'       => __('Title', 'bank-transfer-payment-gateway'),
 				'type'        => 'text',
 				'description' => __('This controls the title which the user sees during checkout.', 'bank-transfer-payment-gateway'),
-				'default'     => __('Buy with USDC Using Your Credit/Debit Card, Apple Pay or Google Pay — Secure, Modern Checkout 🔐', 'bank-transfer-payment-gateway'),
+				'default'     => __('Pay by bank transfer (ACH)', 'bank-transfer-payment-gateway'),
 				'desc_tip'    => true,
 			],
 
@@ -786,8 +804,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				'type'        => 'textarea',
 				'description' => __('Provide a brief description of the payment option.', 'bank-transfer-payment-gateway'),
 				'default'     => __(
-					'<p style="margin:0 0 6px; font-size:13px;">Use a Credit Card, Debit Card or Google Pay, Apple Pay to complete your purchase via USDC.</p>
-					<p style="margin:0 0 6px; font-size:13px;">The transaction will appear on your bank or card statement as *Bank Transfer</p>',
+					'<p style="margin:0 0 6px; font-size:13px;">Pay directly from your US bank account. You will be taken to RT\'s secure payment page to connect your bank and authorise the transfer.</p>
+					<p style="margin:0 0 6px; font-size:13px;">Bank transfers take 1 to 5 business days to settle; your order is confirmed once the funds arrive.</p>',
 					'bank-transfer-payment-gateway'
 				),
 				'desc_tip'    => true,
@@ -853,12 +871,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 	}
 
 	public function generate_accounts_repeater_html($key, $data) {
-		$option_value    = get_option('woocommerce_bank_transfer_payment_gateway_accounts', []);
-		$option_value    = maybe_unserialize($option_value);
-		$active_account  = get_option('bank_transfer_active_account', 0);
-		$global_settings = get_option('woocommerce_bank_transfer_settings', []);
-		$global_settings = maybe_unserialize($global_settings);
-		$sandbox_enabled = !empty($global_settings['sandbox']) && $global_settings['sandbox'] === 'yes';
+		$option_value    = bank_transfer_get_accounts();
+		$sandbox_enabled = bank_transfer_is_sandbox();
 
 		// Render-only normalisation. This method runs on a GET of the settings page, so it must not
 		// write options; missing unique_ids are persisted by the save handler and the migration.
@@ -889,8 +903,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				<div class="bank_transfer-accounts-container bank-transfer-accounts-container">
 					<?php if (!empty($option_value)): ?>
 						<div class="bank_transfer-sync-account bank-transfer-sync-account">
-							<span id="bank_transfer-sync-status"></span>
-							<button class="button" id="bank_transfer-sync-accounts"><span><i class="fa fa-refresh" aria-hidden="true"></i></span> <?php esc_html_e('Sync Accounts', 'bank-transfer-payment-gateway'); ?></button>
+							<span id="<?php echo esc_attr($this->id); ?>-sync-status"></span>
+							<button class="button" id="<?php echo esc_attr($this->id); ?>-sync-accounts"><span><i class="fa fa-refresh" aria-hidden="true"></i></span> <?php esc_html_e('Sync Accounts', 'bank-transfer-payment-gateway'); ?></button>
 						</div>
 					<?php endif; ?>
 
@@ -1032,7 +1046,26 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		return ob_get_clean();
 	}
 
+	/**
+	 * WooCommerce entry point for both checkouts.
+	 *
+	 * The classic checkout reads the result array (result / redirect). The
+	 * Store API (block checkout, BK-08) turns a thrown exception into the
+	 * error the shopper sees, so a refusal is thrown there instead of
+	 * returned as 'failure' with a generic message.
+	 */
 	public function process_payment($order_id)
+	{
+		$result = $this->bank_transfer_do_process_payment($order_id);
+
+		if (($result['result'] ?? '') !== 'success' && $this->is_store_api_request()) {
+			throw new \Exception(esc_html($result['message'] ?: __('Payment could not be initiated. Please try again in a moment.', 'bank-transfer-payment-gateway')));
+		}
+
+		return $result;
+	}
+
+	private function bank_transfer_do_process_payment($order_id)
 	{
 		global $wpdb;
 
@@ -1067,8 +1100,22 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			}
 
 			return $this->build_response(
-				'fail',
+				'failure',
 				'Invalid order.',
+				[],
+				400,
+				$order_id
+			);
+		}
+
+		if (!bank_transfer_is_gateway_order($order)) {
+			if (is_checkout()) {
+				wc_add_notice(__('Invalid payment method.', 'bank-transfer-payment-gateway'), 'error');
+			}
+
+			return $this->build_response(
+				'failure',
+				'Invalid payment method.',
 				[],
 				400,
 				$order_id
@@ -1100,7 +1147,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 
 		if ((string)$lock_result !== '1') {
 			return $this->build_response(
-				'fail',
+				'failure',
 				'Payment already in progress. Please wait a few seconds and try again.',
 				[],
 				409,
@@ -1111,13 +1158,13 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		try {
 
 			// -------------------------------------------------
-			// 4. RATE LIMITING (UNCHANGED)
+			// 4. RATE LIMITING (BK-17: per session, not per shared IP)
 			// -------------------------------------------------
-			$ip_address  = filter_var(wp_unslash($_SERVER['REMOTE_ADDR'] ?? ''), FILTER_VALIDATE_IP) ?: 'invalid';
-			$window_size = 10;
+			$subject      = bank_transfer_rate_limit_subject();
+			$window_size  = 10;
 			$max_requests = 5;
 
-			$timestamp_key = "rate_limit_{$ip_address}_timestamps";
+			$timestamp_key = 'bt_rl_pay_' . md5($subject);
 			$timestamps    = get_transient($timestamp_key) ?: [];
 			$current_time  = time();
 
@@ -1128,7 +1175,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				Bank_Transfer_Payment_Gateway_Logger::warning(
 					$log_prefix . ' Rate limit exceeded',
 					[
-						'ip_address' => $ip_address,
+						'subject' => strpos($subject, 'ip:') === 0 ? bank_transfer_anonymize_ip(substr($subject, 3)) : 'session',
 					]
 				);
 
@@ -1137,7 +1184,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				}
 
 				return $this->build_response(
-					'fail',
+					'failure',
 					'Too many requests. Please try again later.',
 					[],
 					429,
@@ -1159,17 +1206,65 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 					WC()->cart->empty_cart();
 				}
 
-				$redirect = $status === 'completed'
-				? $order->get_checkout_order_received_url()
-				: $order->get_cancel_order_url();
-
 				return $this->build_response(
 					'success',
 					'Order already processed',
-					[],
+					[
+						'redirect' => $order->get_checkout_order_received_url(),
+					],
 					200,
 					$order->get_id()
 				);
+			}
+
+			if ($status === BANK_TRANSFER_RETURNED_STATUS) {
+				return $this->build_response(
+					'failure',
+					__('The bank returned the payment for this order. Please contact the shop.', 'bank-transfer-payment-gateway'),
+					[],
+					409,
+					$order_id
+				);
+			}
+
+			// -------------------------------------------------
+			// 5b. BK-04: never issue a second link while a debit is in flight.
+			// A debit the customer already authorised is on its way; a new link
+			// would let them pay twice. Refresh from RT first in case the
+			// in-flight state is stale.
+			// -------------------------------------------------
+			if (BANK_TRANSFER_PAYMENT_ENGINE::is_in_flight($order) && class_exists('BANK_TRANSFER_PAYMENT_GATEWAY_Loader')) {
+				$live = BANK_TRANSFER_PAYMENT_GATEWAY_Loader::get_instance()->sync_single_order_status($order);
+				$order = wc_get_order($order_id);
+
+				if ($live === 'success' || $order->has_status(['processing', 'completed'])) {
+					if (WC()->cart) {
+						WC()->cart->empty_cart();
+					}
+					return $this->build_response(
+						'success',
+						'Order already processed',
+						[
+							'redirect' => $order->get_checkout_order_received_url(),
+						],
+						200,
+						$order_id
+					);
+				}
+
+				if ($live === 'processing' || BANK_TRANSFER_PAYMENT_ENGINE::is_in_flight($order)) {
+					$message = __('A bank transfer for this order is already in progress. Please wait for it to complete before paying again.', 'bank-transfer-payment-gateway');
+					if (is_checkout()) {
+						wc_add_notice($message, 'error');
+					}
+					return $this->build_response(
+						'failure',
+						$message,
+						[],
+						409,
+						$order_id
+					);
+				}
 			}
 
 			// -------------------------------------------------
@@ -1194,7 +1289,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 
 		if (empty($accounts)) {
 			return $this->build_response(
-				'fail',
+				'failure',
 				'No eligible payment provider available.',
 				[],
 				400,
@@ -1218,9 +1313,9 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				: $account['live_secret_key'];
 
 			// Prepare payment data
-			$data = $this->bank_transfer_prepare_payment_data($order, $public_key, $secret_key);
+			$data = $this->bank_transfer_prepare_payment_data($order, $public_key);
 
-			if (is_array($data) && ($data['result'] ?? '') === 'fail') {
+			if (is_array($data) && ($data['result'] ?? '') === 'failure') {
 
 				Bank_Transfer_Payment_Gateway_Logger::warning(
 					$log_prefix . ' Account preparation failed',
@@ -1238,22 +1333,19 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				continue;
 			}
 
+			// BK-10: the secret only signs the request; it is never in the body.
 			$limit_url = $this->get_api_url('/dailylimit');
-			$limit_payload = [
+			$limit_body = wp_json_encode([
 				'is_sandbox'     => $this->sandbox ? 1 : 0,
 				'amount'         => (float) $order->get_total(),
 				'api_public_key' => $public_key,
-				'api_secret'     => $secret_key,
-			];
+			]);
 
 			$limit_resp = wp_remote_post($limit_url, [
 				'method'    => 'POST',
 				'timeout'   => 5,
-				'body'      => wp_json_encode($limit_payload),
-				'headers'   => [
-					'Content-Type'  => 'application/json',
-					'Authorization' => 'Bearer ' . sanitize_text_field($public_key),
-				],
+				'body'      => $limit_body,
+				'headers'   => bank_transfer_signed_headers($public_key, $secret_key, $limit_body),
 				'sslverify' => true,
 			]);
 
@@ -1321,7 +1413,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 					if (!empty($last_error_data['max_limit_reached'])) {
 
 						return $this->build_response(
-							'fail',
+							'failure',
 							'The transaction amount exceeds the maximum allowed limit.',
 							[],
 							400,
@@ -1333,7 +1425,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 					$order->save();
 
 					return $this->build_response(
-						'fail',
+						'failure',
 						sanitize_text_field($last_error_data['message'] ?? 'Payment limit error.'),
 						[],
 						400,
@@ -1349,7 +1441,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				);
 
 				return $this->build_response(
-					'fail',
+					'failure',
 					'No eligible payment provider available for this order',
 					[],
 					400,
@@ -1366,28 +1458,23 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				$public_key = $this->sandbox ? $account['sandbox_public_key'] : $account['live_public_key'];
 				$secret_key = $this->sandbox ? $account['sandbox_secret_key'] : $account['live_secret_key'];
 
-				$api_url = esc_url($this->get_api_url('/request-payment'));
-				$timestamp = time();
-				$raw_body  = is_array($data) ? http_build_query($data) : (string) $data;
-				$signature = hash_hmac('sha256', $timestamp . '.' . $raw_body, $secret_key);
+				// BK-10: the body is built once and sent exactly as signed. The
+				// secret key signs the request and is never part of it.
+				$api_url  = esc_url($this->get_api_url('/request-payment'));
+				$raw_body = is_array($data) ? http_build_query($data, '', '&') : (string) $data;
 
 				$response = wp_remote_post($api_url, [
 					'method'    => 'POST',
 					'timeout'   => 30,
-					'body'      => $data,
-					'headers'   => [
-						'Content-Type'  => 'application/x-www-form-urlencoded',
-						'Authorization' => 'Bearer ' . sanitize_text_field($public_key),
-						'X-Signature'   => $signature,
-						'X-Timestamp'   => (string) $timestamp,
-					],
+					'body'      => $raw_body,
+					'headers'   => bank_transfer_signed_headers($public_key, $secret_key, $raw_body, 'application/x-www-form-urlencoded'),
 					'sslverify' => true,
 				]);
 
 				if (is_wp_error($response)) {
 
 					return $this->build_response(
-						'fail',
+						'failure',
 						'Payment error: Unable to process.',
 						[],
 						500,
@@ -1440,12 +1527,12 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 						]
 					);
 
-					if (!$this->is_block_checkout_request() && is_checkout()) {
+					if (is_checkout()) {
 						wc_add_notice($error_msg, 'error');
 					}
 
 					return $this->build_response(
-						'fail',
+						'failure',
 						$error_msg,
 						[],
 						($http_code >= 400 && $http_code < 500) ? $http_code : 400,
@@ -1467,7 +1554,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 					);
 
 					return $this->build_response(
-						'fail',
+						'failure',
 						'Payment could not be initiated. Please try again in a moment.',
 						[],
 						500,
@@ -1476,42 +1563,30 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				}
 
 				// -------------------------------------------------
-				// 9. DATABASE (UNCHANGED - KEPT EXACTLY SAME)
+				// 9. DATABASE: one row per issued link (BK-04 history, BK-12 own table)
 				// -------------------------------------------------
-				$table_name = esc_sql($wpdb->prefix . 'order_payment_link');
+				$table_name = esc_sql(bank_transfer_table_name());
 
 				// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-				$existing = $wpdb->get_var($wpdb->prepare(
-					"SELECT id FROM {$table_name} WHERE order_id = %d",
+				$latest = $wpdb->get_row($wpdb->prepare(
+					"SELECT id, uuid FROM {$table_name} WHERE order_id = %d ORDER BY id DESC LIMIT 1",
 					$order_id
-				));
+				), ARRAY_A);
 
-				if ($existing) {
+				$row = [
+					'order_id'       => $order_id,
+					'uuid'           => sanitize_text_field($pay_id),
+					'payment_link'   => esc_url_raw($payment_link),
+					'customer_email' => sanitize_email($resp_data['data']['customer_email'] ?? ''),
+					'amount'         => number_format((float)($resp_data['data']['amount'] ?? 0), 2, '.', ''),
+					'created_at'     => current_time('mysql', 1),
+				];
 
-					$wpdb->update(
-						$table_name,
-						[
-							'uuid'           => sanitize_text_field($pay_id),
-							'payment_link'   => esc_url_raw($payment_link),
-							'customer_email' => sanitize_email($resp_data['data']['customer_email'] ?? ''),
-							'amount'         => number_format((float)($resp_data['data']['amount'] ?? 0), 2, '.', ''),
-							'created_at'     => current_time('mysql', 1),
-						],
-						['order_id' => $order_id]
-					);
+				if (is_array($latest) && (string) ($latest['uuid'] ?? '') === (string) $pay_id) {
+					// RT handed back the same (still open) link: refresh the row.
+					$wpdb->update($table_name, $row, ['id' => (int) $latest['id']]);
 				} else {
-
-					$wpdb->insert(
-						$table_name,
-						[
-							'order_id'       => $order_id,
-							'uuid'           => sanitize_text_field($pay_id),
-							'payment_link'   => esc_url_raw($payment_link),
-							'customer_email' => sanitize_email($resp_data['data']['customer_email'] ?? ''),
-							'amount'         => number_format((float)($resp_data['data']['amount'] ?? 0), 2, '.', ''),
-							'created_at'     => current_time('mysql', 1),
-						]
-					);
+					$wpdb->insert($table_name, $row);
 				}
 				// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
@@ -1520,9 +1595,23 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				wp_cache_delete('bank_transfer_payment_link_uuid_' . intval($order_id), 'bank_transfer_payment_gateway');
 
 				// -------------------------------------------------
-				// 10. PAY ID UPDATE (UNCHANGED)
+				// 10. PAY ID UPDATE (every id the order was ever issued is kept, BK-04)
 				// -------------------------------------------------
 				if (!empty($pay_id)) {
+
+					$history = $order->get_meta('_bank_transfer_pay_id_history');
+					$history = is_array($history) ? $history : [];
+					$known   = array_map(static function ($entry) {
+						return (string) (is_array($entry) ? ($entry['pay_id'] ?? '') : $entry);
+					}, $history);
+					if (!in_array((string) $pay_id, $known, true)) {
+						$history[] = [
+							'pay_id'     => sanitize_text_field($pay_id),
+							'public_key' => sanitize_text_field($public_key),
+							'created_at' => current_time('mysql', 1),
+						];
+						$order->update_meta_data('_bank_transfer_pay_id_history', $history);
+					}
 
 					$order->update_meta_data('_bank_transfer_pay_id', $pay_id);
 					$order->update_meta_data('_bank_transfer_pay_id_updated_at', time());
@@ -1545,6 +1634,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				// 11. SUCCESS RESPONSE
 				// -------------------------------------------------
 
+				// The order stays pending until RT reports the debit in flight
+				// (BK-03: then on-hold) or settled (then processing/completed).
 				$order->update_status('pending', __('Payment pending.', 'bank-transfer-payment-gateway'));
 
 				bank_transfer_add_unique_order_note(
@@ -1591,7 +1682,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 					]
 				);
 
-				return $this->build_response('fail', 'An internal error occurred.', [], 500, $order_id);
+				return $this->build_response('failure', 'An internal error occurred.', [], 500, $order_id);
 
 			} finally {
 
@@ -1607,20 +1698,19 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		int $code = 200,
 		?int $order_id = null
 	) {
+		// WooCommerce reads result / redirect at the top level (classic checkout
+		// and the Store API alike); the checkout script reads the rest.
 		return [
-			'result'   => $result, // success | fail
-			'message'  => $message,
-			'data'     => $data,
-			'order_id' => $order_id,
-			'code'     => $code,
-			'success'  => $result === 'success',
+			'result'              => $result, // success | failure
+			'message'             => $message,
+			'data'                => $data,
+			'redirect'            => (string) ($data['redirect'] ?? ''),
+			'order_id'            => $order_id,
+			'order_key'           => (string) ($data['order_key'] ?? ''),
+			'bank_transfer_nonce' => (string) ($data['bank_transfer_nonce'] ?? ''),
+			'code'                => $code,
+			'success'             => $result === 'success',
 		];
-	}
-
-	private function is_block_checkout_request() {
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		$action = isset($_REQUEST['action']) ? sanitize_text_field(wp_unslash($_REQUEST['action'])) : '';
-		return wp_doing_ajax() && 'bank_transfer_block_gateway_process' === $action;
 	}
 
 	public function bank_transfer_display_test_order_tag($order) {
@@ -1633,7 +1723,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		if (defined('BANK_TRANSFER_WEBHOOK_URL') && !empty(BANK_TRANSFER_WEBHOOK_URL)) {
 			return BANK_TRANSFER_WEBHOOK_URL;
 		}
-		$url = rest_url('/bank-transfer/v1/data');
+		$url = rest_url('/' . BANK_TRANSFER_REST_NAMESPACE . '/data');
 		return apply_filters('bank_transfer_webhook_url', $url);
 	}
 
@@ -1645,7 +1735,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		return preg_match('/pob|postoffice/', $clean) === 1;
 	}
 
-	private function bank_transfer_prepare_payment_data($order, $api_public_key, $api_secret = '') {
+	private function bank_transfer_prepare_payment_data($order, $api_public_key) {
 		$order_id    = $order->get_id();
 		$is_sandbox  = $this->get_option('sandbox') === 'yes';
 		$request_for = sanitize_email($order->get_billing_email() ?: $order->get_billing_phone());
@@ -1678,7 +1768,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				'Order ID is missing or invalid.',
 				[]
 			);
-			return ['result' => 'fail','error'=>'Order ID is missing or invalid.'];
+			return ['result' => 'failure','error'=>'Order ID is missing or invalid.'];
 		}
 
 		$plugin_version = $this->get_plugin_version();
@@ -1690,18 +1780,14 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			'plugin_version' => $plugin_version,
 		]);
 
-		$user_id = $order->get_customer_id();
-		$is_guest = empty($user_id) ? 1 : 0;
-		if ($is_guest === 1 && !empty($email)) {
-			$existing_user = get_user_by('email', $email);
-			if ($existing_user) {
-				$is_guest = 0;
-				$user_id = $existing_user->ID;
-			}
-		}
+		// BK-06: only the customer WooCommerce attached to the order. A guest
+		// typing a registered customer's e-mail is still a guest; the e-mail is
+		// never mapped to that customer's account.
+		$user_id  = (int) $order->get_customer_id();
+		$is_guest = $user_id > 0 ? 0 : 1;
 
+		// BK-10: no secret in the body; the request is signed with it instead.
 		return [
-			'api_secret'       => $api_secret,
 			'api_public_key'   => $api_public_key,
 			'first_name'       => $first_name,
 			'last_name'        => $last_name,
@@ -1727,7 +1813,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 			'plugin_source'    => 'bank_transfer',
 			'plugin_version'   => $plugin_version,
 			'is_guest'         => $is_guest,
-			'customer_user_id' => $user_id ? $user_id : 0,
+			'customer_user_id' => $user_id,
 		];
 	}
 
@@ -2032,127 +2118,11 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 
 		return $available_gateways;
 	}
-	private function send_plugin_logs($accounts, $public_key, $secret_key, $amount, $gateway_loaded, $pluginLogApiUrl, $force_refresh = false)
-	{
-		$plugin_version = $this->get_plugin_version();
-		$accounts       = $this->update_accounts_uniqueID($accounts);
-		$group_id       = get_option('bank_transfer_group_id');
-		$cache_base     = 'bank_transfer_daily_limit_' . md5($public_key . $amount);
-
-		$sanitized_accounts = array_map(function($acc) {
-			unset($acc['live_secret_key'], $acc['sandbox_secret_key']);
-			return $acc;
-		}, (array) $accounts);
-
-		$plugin_logs_data = [
-			'valid_accounts'         => $sanitized_accounts,
-			'gateway_loaded'         => $gateway_loaded,
-			'plugin_status'          => $gateway_loaded,
-			'plugin_version'         => $plugin_version,
-			'api_public_key'         => $public_key,
-			'signature'              => hash_hmac('sha256', $public_key . '|' . $gateway_loaded, $secret_key),
-			'is_sandbox'             => $this->sandbox,
-			'group_id'               => $group_id ? $group_id : $this->bank_transfer_get_group_id(),
-			'domain_name'            => wp_parse_url(home_url(), PHP_URL_HOST),
-			'wordpress_version'      => get_bloginfo('version'),
-			'woocommerce_version'    => get_option('woocommerce_version') ?: '',
-			'woocommerce_db_version' => get_option('woocommerce_db_version'),
-		];
-
-		$this->get_cached_api_response(
-			$pluginLogApiUrl,
-			$plugin_logs_data,
-			$cache_base . '_pluginlogs',
-			300,
-			$force_refresh
-		);
-	}
-
-	private function gateway_visibility_label($reason) {
-
-		return match ($reason) {
-
-			'no_accounts' => 'No payment accounts configured',
-			'merchant_inactive' => 'Payment provider unavailable',
-			'daily_limit_exceeded' => 'Daily limit reached for this account',
-			'no_eligible_accounts' => 'No valid payment account found',
-			'non_checkout_page' => 'Not on checkout page',
-
-			default => 'Payment validation step executed'
-		};
-	}
-
-	private function hide_gateway($available_gateways, $gateway_id) {
-		unset($available_gateways["bank_transfer"]);
-		$GLOBALS['bank_transfer_gateway_visibility_' . $this->id] = $available_gateways;
-		return $available_gateways;
-	}
-
-	private function log_info_once_per_session($key, $message, $context = [])
-	{
-		if (!function_exists('WC') || !WC()) {
-			return;
-		}
-
-		if (!WC()->session) {
-			return;
-		}
-
-		// -----------------------------
-		// FIXED FLOW DETECTION (REAL WOOCOMMERCE SAFE)
-		// -----------------------------
-		$flow = 'background';
-
-		$is_ajax = defined('DOING_AJAX') && DOING_AJAX;
-		$is_rest = defined('REST_REQUEST') && REST_REQUEST;
-
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
-		$wc_ajax = isset($_REQUEST['wc-ajax']) ? sanitize_text_field(wp_unslash($_REQUEST['wc-ajax'])) : '';
-
-		if (is_checkout()) {
-			$flow = 'checkout_page';
-		} elseif ($is_rest) {
-			$flow = 'checkout_block';
-		} elseif ($is_ajax && $wc_ajax === 'update_order_review') {
-			$flow = 'checkout_refresh';
-		}
-
-		// -----------------------------
-		// SAFE CONTEXT
-		// -----------------------------
-		$clean_context = [
-			'Gateway' => $this->id,
-			'Flow'    => $flow,
-		];
-
-		if (WC()->cart) {
-			$clean_context['Items'] = count(WC()->cart->get_cart());
-			$clean_context['Total'] = (float) WC()->cart->get_total('raw');
-		}
-
-		if (isset($context['reason'])) {
-			$clean_context['Reason'] = $this->gateway_visibility_label($context['reason']);
-		}
-
-		if (isset($context['account'])) {
-			$clean_context['Account'] = $context['account'];
-		}
-
-		// -----------------------------
-		// STABLE SESSION KEY
-		// -----------------------------
-		$session_key = 'bank_transfer_log_' . md5($key . $this->id);
-
-		if (WC()->session->get($session_key)) {
-			return;
-		}
-
-		WC()->session->set($session_key, true);
-
-		Bank_Transfer_Payment_Gateway_Logger::info($message, $clean_context);
-	}
-
-	private function get_cached_api_response($url, $data, $cache_key, $ttl = 300, $force_refresh = false) {
+	/**
+	 * POST a JSON body to RT, signed with the secret (never sent), and cache
+	 * the decoded answer.
+	 */
+	private function get_cached_api_response($url, $data, $cache_key, $ttl = 300, $force_refresh = false, $secret_key = '') {
 		if (!$force_refresh && isset($_GET['refresh_accounts']) && sanitize_text_field(wp_unslash($_GET['refresh_accounts'])) === '1' && isset($_GET['_wpnonce']) && wp_verify_nonce(sanitize_text_field(wp_unslash($_GET['_wpnonce'])), 'refresh_accounts_nonce')) {
 			$force_refresh = true;
 		}
@@ -2162,14 +2132,12 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 		} else {
 			delete_transient($cache_key);
 		}
+		$raw_body = wp_json_encode($data);
 		$response = wp_remote_post($url, [
 			'method'    => 'POST',
 			'timeout'   => 5,
-			'headers'   => [
-				'Content-Type'  => 'application/json',
-				'Authorization' => 'Bearer ' . sanitize_text_field($data['api_public_key'] ?? ''),
-			],
-			'body'      => wp_json_encode($data),
+			'headers'   => bank_transfer_signed_headers($data['api_public_key'] ?? '', $secret_key, $raw_body),
+			'body'      => $raw_body,
 			'sslverify' => true,
 		]);
 		if (is_wp_error($response)) {
@@ -2183,11 +2151,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 	}
 
 	private function get_all_accounts() {
-		$accounts = get_option('woocommerce_bank_transfer_payment_gateway_accounts', []);
-		if (is_string($accounts)) {
-			$unserialized = maybe_unserialize($accounts);
-			$accounts = is_array($unserialized) ? $unserialized : [];
-		}
+		$accounts = bank_transfer_get_accounts();
 		$valid_accounts = [];
 		foreach ($accounts as $i => $account) {
 			if ($this->sandbox) {
@@ -2280,14 +2244,14 @@ class BANK_TRANSFER_PAYMENT_GATEWAY extends WC_Payment_Gateway_CC
 				continue;
 			}
 
+			// BK-10: the secret signs the call; it is not in the body.
 			$data = [
 				'is_sandbox'     => $this->sandbox ? 1 : 0,
 				'amount'         => $amount,
 				'api_public_key' => $public_key,
-				'api_secret'     => $secret_key,
 			];
 			$cache_base  = 'bank_transfer_daily_limit_' . md5($public_key . '_' . $amount);
-			$limit_data  = $this->get_cached_api_response($transactionLimitApiUrl, $data, $cache_base . '_limit', 300, $force_refresh);
+			$limit_data  = $this->get_cached_api_response($transactionLimitApiUrl, $data, $cache_base . '_limit', 300, $force_refresh, $secret_key);
 
 			if (!empty($limit_data) && ($limit_data['status'] ?? '') === 'success') {
 				$selected_account = $account;

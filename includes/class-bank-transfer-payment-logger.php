@@ -23,8 +23,17 @@ class Bank_Transfer_Payment_Gateway_Logger {
 
 	private static function is_debug_enabled(): bool
 	{
-		$settings = get_option('woocommerce_bank_transfer_settings', []);
+		$settings = function_exists('bank_transfer_get_settings') ? bank_transfer_get_settings() : get_option('woocommerce_rt_bank_transfer_settings', []);
 		return is_array($settings) && isset($settings['debug']) && 'yes' === $settings['debug'];
+	}
+
+	/** BK-17: a customer IP never reaches a log line in full. */
+	private static function mask_ip($ip)
+	{
+		if (!is_string($ip) || !filter_var($ip, FILTER_VALIDATE_IP)) {
+			return '***';
+		}
+		return function_exists('wp_privacy_anonymize_ip') ? wp_privacy_anonymize_ip($ip) : '***';
 	}
 
 	private static function mask_email($email)
@@ -102,6 +111,11 @@ class Bank_Transfer_Payment_Gateway_Logger {
 
 			if (in_array($normalized_key, ['phone', 'phonenumber', 'billingphone', 'normalized'], true)) {
 				$clean[$key] = is_array($value) ? '***' : self::mask_phone($value);
+				continue;
+			}
+
+			if (in_array($normalized_key, ['ip', 'ipaddress', 'clientip', 'remoteaddr', 'customerip'], true)) {
+				$clean[$key] = self::mask_ip($value);
 				continue;
 			}
 

@@ -1,4 +1,4 @@
-.bytenft-loader {
+.bank-transfer-loader {
   position: fixed;
   display: none;
   left: 0;
@@ -9,7 +9,7 @@
   z-index: 9999;
 }
 
-.bytenft-loader img {
+.bank-transfer-loader img {
   margin: auto;
   position: absolute;
   top: 0;
@@ -20,7 +20,7 @@
   border-radius: 100%;
 }
 
-.bytenft-loader-background {
+.bank-transfer-loader-background {
   display: none;
   position: fixed;
   top: 0;
@@ -47,7 +47,7 @@
   margin: 0 10px;
 }
 
-.bytenft-main-error {
+.bank-transfer-main-error {
     background: #fff;
     border: 1px solid #df1b41;
     border-radius: 12px;
@@ -55,22 +55,22 @@
     margin-bottom: 20px;
 }
 
-.bytenft-error-header {
+.bank-transfer-error-header {
     font-size: 16px;
     margin-bottom: 8px;
 }
 
-.bytenft-error-message {
+.bank-transfer-error-message {
     margin-bottom: 10px;
     color: #444;
 }
 
-.bytenft-error-fields {
+.bank-transfer-error-fields {
     margin: 0;
     padding-left: 18px;
 }
 
-.bytenft-error-fields li {
+.bank-transfer-error-fields li {
     margin-bottom: 4px;
     color: #111;
     font-size:16px;
@@ -83,11 +83,11 @@
     box-shadow: 0 0 0 1px #df1b41 !important;
 }
 
-#bytenft-checkout-errors {
+.bank-transfer-error-box {
     margin-bottom: 16px;
 }
 
-#bytenft-checkout-errors .wc-block-components-notice-banner {
+.bank-transfer-error-box .wc-block-components-notice-banner {
     display: flex;
     align-items: center;
     gap: 10px;
@@ -96,19 +96,19 @@
     margin-bottom: 16px;
 }
 
-#bytenft-checkout-errors .wc-block-components-notice-banner.is-error {
+.bank-transfer-error-box .wc-block-components-notice-banner.is-error {
     background-color: #fff5f5;
     border: 1px solid #cc1818;
     color: #cc1818;
 }
 
-#bytenft-checkout-errors 
+.bank-transfer-error-box 
 .wc-block-components-notice-banner__content {
     font-size: 14px;
     line-height: 1.5;
 }
 
-#bytenft-checkout-errors .wc-block-components-notice-banner__icon {
+.bank-transfer-error-box .wc-block-components-notice-banner__icon {
     width: 20px !important;
     height: 20px !important;
     min-width: 20px !important;
@@ -116,12 +116,12 @@
     flex-shrink: 0;
 }
 
-#bytenft-checkout-errors .wc-block-components-notice-banner__icon svg {
+.bank-transfer-error-box .wc-block-components-notice-banner__icon svg {
     width: 20px;
     height: 20px;
 }
 
-#bytenft-checkout-errors .wc-block-components-notice-banner__content {
+.bank-transfer-error-box .wc-block-components-notice-banner__content {
     flex: 1;
     font-size: 14px;
     line-height: 1.5;

@@ -39,7 +39,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	{
 
 		$this->base_url = BANK_TRANSFER_BASE_URL;
-		
+
 		$this->admin_notices = new BANK_TRANSFER_PAYMENT_GATEWAY_Admin_Notices();
 
 		add_action('admin_init', [$this, 'bank_transfer_handle_environment_check']);
@@ -47,26 +47,21 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		add_action('plugins_loaded', [$this, 'bank_transfer_init'], 10);
 
 		// Register the AJAX action callback for checking payment status
-		add_action('wp_ajax_bank_transfer_check_payment_status', array($this, 'bank_transfer_handle_check_payment_status_request'));
-		add_action('wp_ajax_nopriv_bank_transfer_check_payment_status', array($this, 'bank_transfer_handle_check_payment_status_request'));
+		add_action('wp_ajax_rt_bank_transfer_check_payment_status', array($this, 'bank_transfer_handle_check_payment_status_request'));
+		add_action('wp_ajax_nopriv_rt_bank_transfer_check_payment_status', array($this, 'bank_transfer_handle_check_payment_status_request'));
 
-		add_action('wp_ajax_bank_transfer_popup_closed_event', array($this, 'handle_popup_close'));
-		add_action('wp_ajax_nopriv_bank_transfer_popup_closed_event', array($this, 'handle_popup_close'));
+		add_action('wp_ajax_rt_bank_transfer_popup_closed_event', array($this, 'handle_popup_close'));
+		add_action('wp_ajax_nopriv_rt_bank_transfer_popup_closed_event', array($this, 'handle_popup_close'));
 
-		add_action('wp_ajax_bank_transfer_manual_sync', [$this, 'bank_transfer_manual_sync_callback']);
+		add_action('wp_ajax_' . BANK_TRANSFER_GATEWAY_ID . '_manual_sync', [$this, 'bank_transfer_manual_sync_callback']);
 		add_filter('cron_schedules', [$this, 'bank_transfer_add_cron_interval']);
-		add_action('bank_transfer_cron_event', [$this, 'handle_cron_event']);
-		add_action('wp_ajax_bank_transfer_block_gateway_process', [$this,'handle_bank_transfer_gateway_ajax']);
-		add_action('wp_ajax_nopriv_bank_transfer_block_gateway_process', [$this,'handle_bank_transfer_gateway_ajax']); 
-		// Order status sync: cron, admin screens, customer return (mirrors the fix shipped in the NFT Checkout gateway)
-		add_action('bank_transfer_async_sync_order', [$this, 'sync_single_order_status'], 10, 1);
+		add_action(BANK_TRANSFER_CRON_HOOK, [$this, 'handle_cron_event']);
+
+		// Order status sync. BK-14: nothing in the admin render path calls RT;
+		// admin screens only queue the async hook below.
+		add_action(BANK_TRANSFER_ASYNC_SYNC_HOOK, [$this, 'sync_single_order_status'], 10, 1);
 		add_action('woocommerce_admin_order_data_after_order_details', [$this, 'bank_transfer_admin_order_sync_on_view'], 5);
 		add_action('current_screen', [$this, 'bank_transfer_admin_orders_screen_sync']);
-		add_action('load-woocommerce_page_wc-orders', [$this, 'bank_transfer_admin_orders_screen_sync']);
-		add_action('load-edit.php', [$this, 'bank_transfer_admin_orders_screen_sync']);
-		add_action('load-post.php', [$this, 'bank_transfer_admin_orders_screen_sync']);
-		add_filter('woocommerce_shop_order_list_table_order_css_classes', [$this, 'bank_transfer_admin_order_row_filter'], 10, 2);
-		add_filter('post_class', [$this, 'bank_transfer_admin_post_class_filter'], 10, 3);
 		add_filter('woocommerce_order_actions', [$this, 'bank_transfer_add_order_actions'], 10, 2);
 		add_action('woocommerce_order_action_bank_transfer_check_status', [$this, 'bank_transfer_process_order_action_check_status']);
 		add_action('woocommerce_before_thankyou', [$this, 'bank_transfer_customer_order_sync']);
@@ -78,7 +73,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		add_action('woocommerce_before_checkout_process', function() {
 			// phpcs:ignore WordPress.Security.NonceVerification.Missing
 			$payment_method = isset($_POST['payment_method']) ? sanitize_text_field(wp_unslash($_POST['payment_method'])) : '';
-			if ('bank_transfer' === $payment_method) {
+			if (BANK_TRANSFER_GATEWAY_ID === $payment_method) {
 				if (function_exists('WC') && WC()->session) {
 					$awaiting_order_id = WC()->session->get('order_awaiting_payment');
 					if ($awaiting_order_id) {
@@ -87,7 +82,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 						$posted_email   = isset($_POST['billing_email']) ? sanitize_email(wp_unslash($_POST['billing_email'])) : '';
 						// phpcs:ignore WordPress.Security.NonceVerification.Missing
 						$posted_phone   = isset($_POST['billing_phone']) ? sanitize_text_field(wp_unslash($_POST['billing_phone'])) : '';
-						
+
 						if ($awaiting_order && ($awaiting_order->get_billing_email() !== $posted_email || $awaiting_order->get_billing_phone() !== $posted_phone)) {
 							WC()->session->set('order_awaiting_payment', null);
 						}
@@ -95,227 +90,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 				}
 			}
 		});
-	}
-
-	/**
-	 * ── FIXED ──────────────────────────────────────────────────────────────────
-	 * Handle the block checkout AJAX payment request.
-	 *
-	 * Root cause of "No available payment accounts":
-	 * `new BANK_TRANSFER_PAYMENT_GATEWAY()` creates a cold instance. In an AJAX
-	 * context WooCommerce has not called init_settings() on it, so
-	 * $this->sandbox defaults to false and get_option() returns empty values.
-	 * get_next_available_account() then finds no matching keys → returns false.
-	 *
-	 * Fix: pull the already-booted instance from WC()->payment_gateways().
-	 * That instance was fully initialised during the normal WC boot cycle so
-	 * sandbox mode and account keys are correct.
-	 * ───────────────────────────────────────────────────────────────────────────
-	 */
-	function handle_bank_transfer_gateway_ajax(){
-		// Nonce verification
-		$nonce = isset($_POST['nonce'])
-			? sanitize_text_field(wp_unslash($_POST['nonce']))
-			: '';
-
-		if (empty($nonce) || !wp_verify_nonce($nonce, 'bank_transfer_payment')) {
-			wp_send_json(['result' => 'fail', 'error' => 'Security check failed.']);
-			die;
-		}
-
-		$this->check_rate_limit('block_ajax', 20, 60);
-
-		// Pull the already-initialised gateway from the WC registry.
-		// Never use `new BANK_TRANSFER_PAYMENT_GATEWAY()` here — see note above.
-		$gateways       = WC()->payment_gateways()->payment_gateways();
-		$bank_transferPayment = $gateways['bank_transfer'] ?? null;
-
-		if (!$bank_transferPayment) {
-			// Fallback: manually instantiate and force-load settings from DB.
-			// Should never happen in normal operation.
-			$bank_transferPayment = new BANK_TRANSFER_PAYMENT_GATEWAY();
-			$bank_transferPayment->init_settings();
-			$bank_transferPayment->load_gateway_settings();
-
-			Bank_Transfer_Payment_Gateway_Logger::warning(
-				'Bank Transfer: gateway not found in WC registry during AJAX — fell back to manual instantiation.',
-				['source' => 'bank-transfer-payment-gateway']
-			);
-		}
-
-		$orderID = WC()->session
-			? ( WC()->session->get('store_api_draft_order') ?: WC()->session->get('order_awaiting_payment') )
-			: null;
-
-		/*
-		 * WooCommerce 10.8+ writes 'store_api_draft_order' in exactly one place:
-		 * the Store API /checkout route (StoreApi/Routes/V1/Checkout.php). This
-		 * handler bypasses that route - the JS calls preventDefault() on Place
-		 * Order and posts here instead - so on WooCommerce 11 the key is never
-		 * set and every block checkout ended at "Invalid order.".
-		 *
-		 * Older WooCommerce created the draft order during the cart routes, so
-		 * the key was already populated by the time Place Order ran. That is why
-		 * this worked in 1.0.16 and stopped working since.
-		 *
-		 * Build the order here, ALWAYS - not only when the pointers are empty.
-		 *
-		 * Reusing a session order id verbatim was sending whatever total that
-		 * order was built with. Once an attempt had been rejected, changing the
-		 * amount changed the cart but never the order, so request-payment kept
-		 * receiving the identical order+amount and kept answering "This order
-		 * appears to be a duplicate".
-		 *
-		 * WC_Checkout::create_order() already resolves this correctly: it
-		 * resumes 'order_awaiting_payment' only while the cart hash still
-		 * matches and the order is pending/failed, otherwise it starts a new
-		 * order - and either way it calls set_data_from_cart(), so items,
-		 * shipping, coupons and totals are rebuilt from the current cart every
-		 * time. A changed amount therefore produces a correct amount, and a
-		 * changed cart produces a new order id that is not a duplicate.
-		 *
-		 * The session pointers stay as the fallback for the case where there is
-		 * no cart to build from.
-		 */
-		if ( ! empty( WC()->cart ) && ! WC()->cart->is_empty() ) {
-			$orderID = $this->bank_transfer_create_block_order() ?: $orderID;
-		}
-
-		$status = [];
-		if($orderID){
-			$status = $bank_transferPayment->process_payment($orderID);
-		}else{
-			wc_add_notice(__('Invalid order.', 'bank-transfer-payment-gateway'), 'error');
-			$status = ['result' => 'fail','error' => 'Invalid order.'];
-		}
-		
-		wp_send_json($status);
-		die;
-	}
-
-	/**
-	 * Create the WooCommerce order for a block checkout payment.
-	 *
-	 * Delegates to WC_Checkout::create_order() so line items, shipping lines,
-	 * coupons, taxes and totals are built by WooCommerce itself rather than by
-	 * hand here.
-	 *
-	 * @return int Order ID, or 0 on failure.
-	 */
-	private function bank_transfer_create_block_order() {
-
-		$checkout = WC()->checkout();
-		$data     = $checkout->get_posted_data();
-		$customer = WC()->customer;
-
-		/*
-		 * Block checkout inputs carry no name attribute, so the serialized form
-		 * posts almost nothing and get_posted_data() returns blanks - it reads
-		 * $_POST only, with no customer fallback. WC()->customer is what the
-		 * Store API keeps in sync as the shopper types, so use it to fill in
-		 * anything the post did not carry.
-		 */
-		if ( $customer ) {
-
-			$fields = [
-				'first_name',
-				'last_name',
-				'company',
-				'address_1',
-				'address_2',
-				'city',
-				'state',
-				'postcode',
-				'country',
-				'phone',
-				'email',
-			];
-
-			/*
-			 * BILLING ONLY - never shipping.
-			 *
-			 * WooCommerce already owns shipping: get_posted_data() decides via
-			 * maybe_skip_fieldset() whether shipping was submitted at all, and
-			 * create_order() copies billing into shipping when ship-to-different
-			 * is off. Writing shipping keys here puts WC()->customer's copy on
-			 * top of that decision, which overrides the address FunnelKit (and
-			 * any other checkout that manages shipping itself) already set.
-			 *
-			 * Leaving shipping untouched keeps WooCommerce's own behaviour.
-			 */
-			foreach ( $fields as $field ) {
-
-				$key = 'billing_' . $field;
-
-				if ( ! empty( $data[ $key ] ) ) {
-					continue;
-				}
-
-				$getter = 'get_' . $key;
-
-				if ( is_callable( [ $customer, $getter ] ) ) {
-					$data[ $key ] = $customer->$getter();
-				}
-			}
-		}
-
-		if ( empty( $data['payment_method'] ) ) {
-			$data['payment_method'] = 'bank_transfer';
-		}
-
-		// Prevent reusing an order if the email address OR phone number doesn't match
-		if ( WC()->session ) {
-			$awaiting_order_id = WC()->session->get('order_awaiting_payment') ?: WC()->session->get('store_api_draft_order');
-			if ( $awaiting_order_id ) {
-				$awaiting_order = wc_get_order( $awaiting_order_id );
-				$posted_email   = sanitize_email( $data['billing_email'] ?? '' );
-				$posted_phone   = sanitize_text_field( $data['billing_phone'] ?? '' );
-				
-				if ( $awaiting_order && ( $awaiting_order->get_billing_email() !== $posted_email || $awaiting_order->get_billing_phone() !== $posted_phone ) ) {
-					WC()->session->set( 'order_awaiting_payment', null );
-					WC()->session->set( 'store_api_draft_order', null );
-				}
-			}
-		}
-
-		$order_id = $checkout->create_order( $data );
-
-		if ( is_wp_error( $order_id ) ) {
-
-			Bank_Transfer_Payment_Gateway_Logger::error(
-				'Could not create order for block checkout',
-				[
-					'error' => $order_id->get_error_message(),
-				]
-			);
-
-			return 0;
-		}
-
-		if ( WC()->session ) {
-			WC()->session->set( 'order_awaiting_payment', $order_id );
-		}
-
-		$created = wc_get_order( $order_id );
-		if ( $created ) {
-			$version = bank_transfer_get_plugin_version();
-			if ( ! empty( $version ) ) {
-				$created->update_meta_data( '_bank_transfer_plugin_version', sanitize_text_field( $version ) );
-				$created->update_meta_data( 'bank_transfer_plugin_version', sanitize_text_field( $version ) );
-				$created->save();
-			}
-		}
-
-		Bank_Transfer_Payment_Gateway_Logger::info(
-			'Created order for block checkout',
-			[
-				'order_id' => $order_id,
-				'total'    => $created ? $created->get_total() : null,
-				'email'    => $created ? $created->get_billing_email() : null,
-			]
-		);
-
-		return $order_id;
 	}
 
 	/**
@@ -335,8 +109,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 
 		// Register blocks gateway
 		$this->bank_transfer_init_blocks();
-		
-		add_action( 'enqueue_block_assets', [ $this, 'register_blocks_assets' ] );
 
 		// Initialize REST API
 		$rest_api = BANK_TRANSFER_PAYMENT_GATEWAY_REST_API::get_instance();
@@ -351,7 +123,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 
 	public function bank_transfer_show_checkout_error()
 	{
-		if (!function_exists('WC')) return;
+		if (!function_exists('WC') || !WC()->session) return;
 
 		$error = WC()->session->get('bank_transfer_error');
 		if (!$error) return;
@@ -382,13 +154,13 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		include_once BANK_TRANSFER_PAYMENT_GATEWAY_PLUGIN_DIR . 'includes/class-bank-transfer-payment-gateway.php';
 
 		add_filter('woocommerce_payment_gateways', function ($methods) {
-			$methods[] = 'BANK_TRANSFER_PAYMENT_GATEWAY';			
+			$methods[] = 'BANK_TRANSFER_PAYMENT_GATEWAY';
 			return $methods;
 		});
 	}
 
 	private function bank_transfer_init_blocks() {
-		
+
 			if ( class_exists( '\Automattic\WooCommerce\Blocks\Payments\Integrations\AbstractPaymentMethodType' ) ) {
 
 				require_once BANK_TRANSFER_PAYMENT_GATEWAY_PLUGIN_DIR . 'includes/class-bank-transfer-blocks-gateway.php';
@@ -397,89 +169,28 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 					$registry->register( new BANK_TRANSFER_Blocks_Gateway() );
 				});
 			}
-	
-	}
-	
-	public function register_blocks_assets() {
-		
-		if ( function_exists('is_checkout') && is_checkout() ) {
-			$image_url = plugin_dir_url( dirname( __FILE__ ) ) . 'assets/images/loader.gif';
-			wp_register_script(
-				'bank-transfer-blocks-js',
-				plugin_dir_url( BANK_TRANSFER_PAYMENT_GATEWAY_FILE ) . 'assets/js/bank-transfer-blocks.js',
-				[ 'wc-blocks-registry', 'wc-settings', 'wp-element' ],
-				'1.0.0',
-				true
-			);
 
-			wp_localize_script(
-				'bank-transfer-blocks-js',
-				'bank_transfer_params',
-				[
-					'ajax_url'             => admin_url('admin-ajax.php'),
-					'bank_transfer_loader' => $image_url,
-					'bank_transfer_nonce'  => wp_create_nonce('bank_transfer_payment'), 
-					'checkout_url'         => wc_get_checkout_url(),
-					'payment_method'       => 'bank_transfer',
-					'plugin_version'       => bank_transfer_get_plugin_version(),
-				]
-			);
-	
-		}
 	}
 
 	/**
 	 * Retrieve merchant credentials associated with an order or active gateway settings.
-	 * Never exposes secret keys in returned order objects or logs.
+	 * Used for read-only status lookups only; the webhook never falls back to
+	 * another account (see the REST API class).
 	 *
 	 * @param WC_Order|null $order
 	 * @return array
 	 */
 	private function get_order_account_credentials($order = null)
 	{
-		$settings   = get_option('woocommerce_bank_transfer_settings', []);
-		$is_sandbox = isset($settings['sandbox']) && $settings['sandbox'] === 'yes';
-
-		$accounts = get_option('woocommerce_bank_transfer_payment_gateway_accounts', []);
-		if (empty($accounts)) {
-			$accounts = isset($settings['accounts']) ? maybe_unserialize($settings['accounts']) : [];
-		}
-		if (is_string($accounts)) {
-			$accounts = maybe_unserialize($accounts);
-		}
-		if (!is_array($accounts)) {
-			$accounts = [];
-		}
-		if (isset($accounts['live_secret_key']) || isset($accounts['sandbox_secret_key'])) {
-			$accounts = [$accounts];
+		$account = bank_transfer_get_order_account($order);
+		if (is_array($account)) {
+			return $account;
 		}
 
-		$order_public_key = ($order instanceof WC_Order) ? $order->get_meta('_bank_transfer_public_key') : '';
-
-		// If public key is saved on the order, locate matching account
-		if (!empty($order_public_key) && !empty($accounts)) {
-			foreach ($accounts as $account) {
-				if (!is_array($account)) {
-					continue;
-				}
-				if (!empty($account['sandbox_public_key']) && hash_equals($account['sandbox_public_key'], $order_public_key)) {
-					return [
-						'public_key' => $account['sandbox_public_key'],
-						'secret_key' => $account['sandbox_secret_key'] ?? '',
-						'is_sandbox' => 1,
-					];
-				}
-				if (!empty($account['live_public_key']) && hash_equals($account['live_public_key'], $order_public_key)) {
-					return [
-						'public_key' => $account['live_public_key'],
-						'secret_key' => $account['live_secret_key'] ?? '',
-						'is_sandbox' => 0,
-					];
-				}
-			}
-		}
+		$is_sandbox = bank_transfer_is_sandbox();
 
 		// Fallback to first available account
+		$accounts = bank_transfer_get_accounts();
 		if (!empty($accounts)) {
 			$first_account = reset($accounts);
 			if (is_array($first_account)) {
@@ -499,12 +210,13 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	}
 
 	/**
-	 * BT-15: Rate limiting helper for public AJAX actions
+	 * BT-15 / BK-17: Rate limiting helper for public AJAX actions, counted per
+	 * WooCommerce session (else per client IP as WooCommerce resolves it).
 	 */
 	public function check_rate_limit($action, $max_requests = 15, $period = 60)
 	{
-		$ip = sanitize_text_field(wp_unslash($_SERVER['REMOTE_ADDR'] ?? 'unknown'));
-		$transient_key = 'bt_rl_' . md5($action . '_' . $ip);
+		$subject = bank_transfer_rate_limit_subject();
+		$transient_key = 'bt_rl_' . md5($action . '_' . $subject);
 		$count = (int) get_transient($transient_key);
 
 		if ($count >= $max_requests) {
@@ -539,7 +251,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	public function bank_transfer_plugin_action_links($links)
 	{
 		$plugin_links = [
-			'<a href="' . esc_url(admin_url('admin.php?page=wc-settings&tab=checkout&section=bank_transfer')) . '">' . esc_html__('Settings', 'bank-transfer-payment-gateway') . '</a>',
+			'<a href="' . esc_url(admin_url('admin.php?page=wc-settings&tab=checkout&section=' . BANK_TRANSFER_GATEWAY_ID)) . '">' . esc_html__('Settings', 'bank-transfer-payment-gateway') . '</a>',
 		];
 
 		return array_merge($plugin_links, $links);
@@ -555,8 +267,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	{
 		if (plugin_basename(BANK_TRANSFER_PAYMENT_GATEWAY_FILE) === $file) {
 			$row_meta = [
-				'docs'    => '<a href="' . esc_url(apply_filters('bank_transfer_docs_url', 'https://qa.rt.app/docs')) . '" target="_blank">' . esc_html__('Documentation', 'bank-transfer-payment-gateway') . '</a>',
-				'support' => '<a href="' . esc_url(apply_filters('bank_transfer_support_url', 'https://qa.rt.app/contact-us')) . '" target="_blank">' . esc_html__('Support', 'bank-transfer-payment-gateway') . '</a>',
+				'docs'    => '<a href="' . esc_url(apply_filters('bank_transfer_docs_url', BANK_TRANSFER_BASE_URL . '/docs')) . '" target="_blank">' . esc_html__('Documentation', 'bank-transfer-payment-gateway') . '</a>',
+				'support' => '<a href="' . esc_url(apply_filters('bank_transfer_support_url', BANK_TRANSFER_BASE_URL . '/contact-us')) . '" target="_blank">' . esc_html__('Support', 'bank-transfer-payment-gateway') . '</a>',
 			];
 
 			$links = array_merge($links, $row_meta);
@@ -577,229 +289,54 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		}
 	}
 
-	/**
-	 * Handle the AJAX request for checking payment status.
-	 * @param $request
-	 */
-	public function bank_transfer_handle_check_payment_status_request($request)
-	{
-		check_ajax_referer('bank_transfer_payment', 'security');
-		$this->check_rate_limit('status_check', 30, 60);
-
-		// Sanitize and validate the order ID from $_POST
-		$order_id = isset($_POST['order_id']) ? intval(sanitize_text_field(wp_unslash($_POST['order_id']))) : null;
-		if (!$order_id || $order_id <= 0) {
-			wp_send_json_error(array('message' => esc_html__('Invalid order ID', 'bank-transfer-payment-gateway')), 400);
-		}
-
-		// Call the function to check payment status with the validated order ID
-		return $this->bank_transfer_check_payment_status($order_id);
-	}
+	/* =========================================================
+	 * CUSTOMER STATUS POLLING (classic checkout popup)
+	 * ========================================================= */
 
 	/**
-	 * Check the payment status for an order.
-	 * @param int $order_id
-	 * @return WP_REST_Response
+	 * Load the order a public status request is about, after the nonce, order
+	 * key and gateway checks (BT-06). Dies with a JSON error otherwise.
+	 *
+	 * @return WC_Order
 	 */
-	public function bank_transfer_check_payment_status($order_id)
+	private function bank_transfer_authorized_order_from_request($log_label)
 	{
-		$order = wc_get_order($order_id);
-		// phpcs:ignore WordPress.Security.NonceVerification.Missing
-		$order_key = isset($_POST['order_key'])
-			// phpcs:ignore WordPress.Security.NonceVerification.Missing
-			? sanitize_text_field(wp_unslash($_POST['order_key']))
-			: '';
-		$log_prefix = "[Order #{$order_id}]";
+		$order_id = isset($_POST['order_id']) ? intval(sanitize_text_field(wp_unslash($_POST['order_id']))) : 0; // phpcs:ignore WordPress.Security.NonceVerification.Missing
+		$order_key = isset($_POST['order_key']) ? sanitize_text_field(wp_unslash($_POST['order_key'])) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Missing
 
-		// BT-06: Strict authorization check - order must exist, belong to bank_transfer, and key must match via hash_equals
+		$order = ($order_id > 0) ? wc_get_order($order_id) : false;
+
 		if (
 			!$order ||
-			$order->get_payment_method() !== 'bank_transfer' ||
+			!bank_transfer_is_gateway_order($order) ||
 			empty($order_key) ||
 			!hash_equals($order->get_order_key(), $order_key)
 		) {
 			Bank_Transfer_Payment_Gateway_Logger::info(
-				$log_prefix . ' CheckStatus | Security check failed (invalid key or non-bank-transfer order)'
+				"[Order #{$order_id}] {$log_label} | Security check failed (invalid key or non-bank-transfer order)"
 			);
 
 			wp_send_json_error([
+				'reload'       => false,
 				'message'      => 'Security check failed.',
 				'stop_polling' => true
 			], 403);
 			wp_die();
 		}
 
-		// -------------------------
-		// API CALL
-		// -------------------------
-		$payment_token = $this->bank_transfer_resolve_order_pay_id($order);
-		$creds         = $this->get_order_account_credentials($order);
-		$public_key    = $creds['public_key'];
-		$secret_key    = $creds['secret_key'];
-
-		if (empty($public_key) || empty($secret_key)) {
-			Bank_Transfer_Payment_Gateway_Logger::warning(
-				$log_prefix . ' CheckStatus | Missing API credentials for merchant account'
-			);
-
-			wp_send_json_error([
-				'message'      => 'Missing merchant account credentials.',
-				'stop_polling' => true,
-			], 400);
-
-			wp_die();
-		}
-
-		$lookup   = $this->bank_transfer_fetch_remote_payment_status($order, $payment_token, $creds);
-		$response = $lookup['response'];
-
-		if (is_wp_error($response)) {
-			Bank_Transfer_Payment_Gateway_Logger::warning(
-				$log_prefix . ' CheckStatus | Network error: ' . $response->get_error_message()
-			);
-
-			wp_send_json_error([
-				'message'      => 'API connection failed.',
-				'stop_polling' => false,
-			], 500);
-
-			wp_die();
-		}
-
-		$http_code = (int) wp_remote_retrieve_response_code($response);
-
-		if ($http_code === 401) {
-			Bank_Transfer_Payment_Gateway_Logger::warning(
-				$log_prefix . ' CheckStatus | API authentication error (HTTP 401)'
-			);
-
-			wp_send_json_error([
-				'message'      => 'API authentication failed. Please verify merchant credentials.',
-				'stop_polling' => true,
-			], 401);
-
-			wp_die();
-		}
-
-		if ($http_code === 429) {
-			Bank_Transfer_Payment_Gateway_Logger::warning(
-				$log_prefix . ' CheckStatus | Upstream rate limit reached (HTTP 429)'
-			);
-
-			wp_send_json_error([
-				'message'      => 'Rate limit exceeded. Please wait a moment.',
-				'stop_polling' => false,
-			], 429);
-
-			wp_die();
-		}
-
-		if ($http_code < 200 || $http_code >= 300) {
-			Bank_Transfer_Payment_Gateway_Logger::warning(
-				$log_prefix . " CheckStatus | Upstream returned non-2xx status (HTTP {$http_code})"
-			);
-
-			wp_send_json_error([
-				'message'      => 'Unable to check transaction status at this time.',
-				'stop_polling' => false,
-			], $http_code >= 400 && $http_code < 600 ? $http_code : 500);
-
-			wp_die();
-		}
-
-		$response_data = is_array($lookup['data']) ? $lookup['data'] : json_decode(wp_remote_retrieve_body($response), true);
-
-		if (!is_array($response_data)) {
-			Bank_Transfer_Payment_Gateway_Logger::warning(
-				$log_prefix . ' CheckStatus | Invalid API response'
-			);
-
-			wp_send_json_error([
-				'message'      => 'Invalid API response.',
-				'stop_polling' => false,
-			], 500);
-
-			wp_die();
-		}
-
-		$payment_status = $this->bank_transfer_normalize_remote_status($response_data);
-
-			
-		// -------------------------
-		// ENGINE CALL
-		// -------------------------
-		if ($payment_status) {
-			Bank_Transfer_Payment_Gateway_Logger::info(
-				$log_prefix . " CheckStatus | Engine trigger ({$payment_status})"
-			);
-
-			$result = BANK_TRANSFER_PAYMENT_ENGINE::handle_event(
-				$order_id,
-				'redirect_check',
-				[
-					'status'        => $payment_status,
-					'payment_token' => $payment_token,
-				]
-			);
-
-			Bank_Transfer_Payment_Gateway_Logger::info(
-				$log_prefix . " CheckStatus | Engine result: " . wp_json_encode($result)
-			);
-		}
-
-		// -------------------------
-		// REFRESH ORDER
-		// -------------------------
-		$order = wc_get_order($order_id);
-
-		$wc_status = $order->get_status();
-
-		$state = BANK_TRANSFER_PAYMENT_ENGINE::resolve_final_state(
-			$order,
-			$payment_status
-		);
-
-		/**
-		 * SUCCESS ALWAYS WINS
-		 */
-		if ($order->has_status(['processing', 'completed'])) {
-			$state = 'success';
-		}
-
-		// -------------------------
-		// REDIRECT
-		// -------------------------
-		$redirect = null;
-
-		if ($order->has_status(['processing', 'completed'])) {
-			$redirect = $order->get_checkout_order_received_url();
-		} elseif (in_array($state, ['failed', 'cancelled'], true)) {
-			$redirect = wc_get_checkout_url();
-		}
-
-		// -------------------------
-		// RESPONSE
-		// -------------------------
-		wp_send_json_success([
-			'status'        => $state,
-			'payment_status'=> $payment_status,
-			'order_status'  => $wc_status,
-			'redirect_url'  => $redirect,
-		]);
-
-		wp_die();
+		return $order;
 	}
 
-	private function bank_transfer_log($message, $context = [])
+	/**
+	 * Handle the AJAX request for checking payment status.
+	 */
+	public function bank_transfer_handle_check_payment_status_request()
 	{
-		if (function_exists('wc_get_logger')) {
-			Bank_Transfer_Payment_Gateway_Logger::info(
-				$message,
-				array_merge([
-					'source' => 'bank-transfer-payment-gateway'
-				], $context)
-			);
-		}
+		check_ajax_referer('bank_transfer_payment', 'security');
+		$this->check_rate_limit('status_check', 30, 60);
+
+		$order = $this->bank_transfer_authorized_order_from_request('CheckStatus');
+		$this->bank_transfer_answer_status_poll($order, 'redirect_check', 'CheckStatus');
 	}
 
 	public function handle_popup_close()
@@ -807,144 +344,39 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		check_ajax_referer('bank_transfer_payment', 'security');
 		$this->check_rate_limit('popup_close', 30, 60);
 
-		$order_id = isset($_POST['order_id'])
-			? intval(sanitize_text_field(wp_unslash($_POST['order_id'])))
-			: 0;
+		$order = $this->bank_transfer_authorized_order_from_request('PopupClose');
+		$this->bank_transfer_answer_status_poll($order, 'popup_close', 'PopupClose');
+	}
 
-		$order_key = isset($_POST['order_key'])
-			? sanitize_text_field(wp_unslash($_POST['order_key']))
-			: '';
-
+	/**
+	 * Ask RT for the payment's status, push it through the shared validation
+	 * and the engine, and answer the polling checkout page.
+	 */
+	private function bank_transfer_answer_status_poll($order, $event_type, $log_label)
+	{
+		$order_id   = $order->get_id();
 		$log_prefix = "[Order #{$order_id}]";
 
-		// -------------------------
-		// ORDER & SECURITY CHECK (BT-06)
-		// -------------------------
-		$order = ($order_id > 0) ? wc_get_order($order_id) : false;
+		$outcome = $this->bank_transfer_refresh_order_from_remote($order, $event_type);
 
-		if (
-			!$order ||
-			$order->get_payment_method() !== 'bank_transfer' ||
-			empty($order_key) ||
-			!hash_equals($order->get_order_key(), $order_key)
-		) {
-			Bank_Transfer_Payment_Gateway_Logger::info(
-				$log_prefix . ' PopupClose | Security check failed (invalid key or non-bank-transfer order)'
-			);
+		if (!empty($outcome['error'])) {
+			$http = (int) ($outcome['http_code'] ?? 0);
+			$stop = in_array($http, [401, 403], true) || ($outcome['reason'] ?? '') === 'credentials';
 
-			wp_send_json_error([
-				'reload'       => false,
-				'stop_polling' => true,
-				'message'      => 'Security verification failed.'
-			], 403);
-
-			wp_die();
-		}
-
-		// -------------------------
-		// API CALL
-		// -------------------------
-		$payment_token = $this->bank_transfer_resolve_order_pay_id($order);
-		$creds         = $this->get_order_account_credentials($order);
-		$public_key    = $creds['public_key'];
-		$secret_key    = $creds['secret_key'];
-
-		if (empty($public_key) || empty($secret_key)) {
 			Bank_Transfer_Payment_Gateway_Logger::warning(
-				$log_prefix . ' PopupClose | Missing API credentials for merchant account'
+				"{$log_prefix} {$log_label} | " . $outcome['error']
 			);
 
 			wp_send_json_error([
 				'reload'       => false,
-				'stop_polling' => true,
-				'message'      => 'Missing merchant account credentials.',
-			], 400);
-
+				'stop_polling' => $stop,
+				'message'      => $outcome['error'],
+			], $http >= 400 && $http < 600 ? $http : 500);
 			wp_die();
 		}
 
-		$lookup   = $this->bank_transfer_fetch_remote_payment_status($order, $payment_token, $creds);
-		$response = $lookup['response'];
+		$payment_status = $outcome['state'];
 
-		if (is_wp_error($response)) {
-			Bank_Transfer_Payment_Gateway_Logger::warning(
-				$log_prefix . ' PopupClose | Network error: ' . $response->get_error_message()
-			);
-
-			wp_send_json_error([
-				'reload'       => false,
-				'stop_polling' => false,
-				'message'      => 'API connection failed.',
-			], 500);
-
-			wp_die();
-		}
-
-		$http_code = (int) wp_remote_retrieve_response_code($response);
-
-		if ($http_code === 401) {
-			Bank_Transfer_Payment_Gateway_Logger::warning(
-				$log_prefix . ' PopupClose | API authentication error (HTTP 401)'
-			);
-
-			wp_send_json_error([
-				'reload'       => false,
-				'stop_polling' => true,
-				'message'      => 'Payment authentication error. Please verify merchant credentials.',
-			], 401);
-
-			wp_die();
-		}
-
-		if ($http_code === 429) {
-			Bank_Transfer_Payment_Gateway_Logger::warning(
-				$log_prefix . ' PopupClose | Upstream rate limit reached (HTTP 429)'
-			);
-
-			wp_send_json_error([
-				'reload'       => false,
-				'stop_polling' => false,
-				'message'      => 'Rate limit exceeded. Please wait a moment.',
-			], 429);
-
-			wp_die();
-		}
-
-		if ($http_code < 200 || $http_code >= 300) {
-			Bank_Transfer_Payment_Gateway_Logger::warning(
-				$log_prefix . " PopupClose | Upstream returned non-2xx status (HTTP {$http_code})"
-			);
-
-			wp_send_json_error([
-				'reload'       => false,
-				'stop_polling' => false,
-				'message'      => 'Unable to verify payment status at this time.',
-			], $http_code >= 400 && $http_code < 600 ? $http_code : 500);
-
-			wp_die();
-		}
-
-		$response_data = is_array($lookup['data']) ? $lookup['data'] : json_decode(wp_remote_retrieve_body($response), true);
-
-		if (!is_array($response_data)) {
-			Bank_Transfer_Payment_Gateway_Logger::warning(
-				$log_prefix . ' PopupClose | Invalid API response'
-			);
-
-			wp_send_json_error([
-				'reload'       => false,
-				'stop_polling' => false,
-				'message'      => 'Invalid API response.',
-			], 500);
-
-			wp_die();
-		}
-
-		$payment_status = $this->bank_transfer_normalize_remote_status($response_data);
-
-		// -------------------------
-		// NO STATUS
-		// -------------------------
 		if (!$payment_status) {
 			wp_send_json([
 				'success' => false,
@@ -958,85 +390,42 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 					'stop_polling'   => false,
 				]
 			]);
-
 			wp_die();
 		}
-
-		// -------------------------
-		// ENGINE CALL
-		// -------------------------
-		$result = BANK_TRANSFER_PAYMENT_ENGINE::handle_event(
-			$order_id,
-			'popup_close',
-			[
-				'status'        => $payment_status,
-				'payment_token' => $payment_token,
-			]
-		);
-
-		Bank_Transfer_Payment_Gateway_Logger::info(
-			$log_prefix . " PopupClose | Engine result: " . wp_json_encode($result)
-		);
 
 		// -------------------------
 		// ALWAYS RELOAD ORDER AFTER ENGINE
 		// -------------------------
 		$order = wc_get_order($order_id);
 
-		// 🔥 PRIMARY STATE = ENGINE STORED STATE ONLY
 		$state = BANK_TRANSFER_PAYMENT_ENGINE::resolve_final_state($order, $payment_status);
 
-		// -------------------------
-		// HARD OVERRIDE SAFETY (ONLY ONE SOURCE)
-		// -------------------------
 		if ($order->get_meta('_bank_transfer_state') === 'success' || $order->has_status(['processing', 'completed'])) {
 			$state = 'success';
 		}
 
-		// -------------------------
-		// FINAL SUCCESS CHECK
-		// -------------------------
 		$is_success = ($state === 'success');
 
-		// -------------------------
-		// MESSAGE
-		// -------------------------
 		$message = match ($state) {
-			'success' =>
-				'Your payment was completed successfully.',
-
-			'failed' =>
-				'Payment failed. Please try again or use another method.',
-
-			'cancelled' =>
-				'You cancelled the payment.',
-
-			'processing' =>
-				'Payment is being processed.',
-
-			default =>
-				'We couldn’t confirm your payment status yet. If needed, you can try placing the order again after checking your order status.'
+			'success'    => 'Your payment was completed successfully.',
+			'failed'     => 'Payment failed. Please try again or use another method.',
+			'cancelled'  => 'You cancelled the payment.',
+			'expired'    => 'The payment session expired. Please try again.',
+			'processing' => 'Your bank transfer has been authorised and is being processed.',
+			default      => 'We couldn’t confirm your payment status yet. If needed, you can try placing the order again after checking your order status.'
 		};
 
-		// -------------------------
-		// REDIRECT
-		// -------------------------
+		// A settled payment and an authorised (in-flight) debit both send the
+		// customer to the order-received page; a closed attempt goes back to checkout.
 		$redirect = null;
-
-		// 🔥 ONLY ENGINE STATE DECIDES REDIRECT
-		if ($state === 'success') {
+		if ($state === 'success' || $state === 'processing') {
 			$redirect = $order->get_checkout_order_received_url();
 		} elseif (in_array($state, ['failed', 'cancelled', 'expired'], true)) {
 			$redirect = wc_get_checkout_url();
-		} else {
-			$redirect = null; // processing → no redirect
 		}
 
-		$stop_polling = in_array($state, ['success', 'failed', 'cancelled', 'expired'], true);
+		$stop_polling = in_array($state, ['success', 'processing', 'failed', 'cancelled', 'expired'], true);
 
-		// -------------------------
-		// RESPONSE
-		// -------------------------
 		wp_send_json([
 			'success' => $is_success,
 			'message' => $message,
@@ -1049,7 +438,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 				'stop_polling'   => $stop_polling,
 			]
 		]);
-
 		wp_die();
 	}
 
@@ -1058,9 +446,9 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
      */
 	public function bank_transfer_add_cron_interval($schedules)
 	{
-		$schedules['every_two_hours'] = array(
+		$schedules[BANK_TRANSFER_CRON_INTERVAL] = array(
 			'interval' => 2 * 60 * 60, // 2 hours in seconds = 7200
-			'display'  => __('Every Two Hours', 'bank-transfer-payment-gateway')
+			'display'  => __('Every Two Hours (RT Bank Transfer)', 'bank-transfer-payment-gateway')
 		);
 		return $schedules;
 	}
@@ -1070,70 +458,60 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		Bank_Transfer_Payment_Gateway_Logger::info('Automatic payment status checks have been enabled.', ['source' => 'bank-transfer-payment-gateway']);
 
 		// Clear existing scheduled event if it exists
-		$timestamp = wp_next_scheduled('bank_transfer_cron_event');
-		if ($timestamp) {
-			wp_unschedule_event($timestamp, 'bank_transfer_cron_event');
-		}
+		wp_clear_scheduled_hook(BANK_TRANSFER_CRON_HOOK);
 
 		// Schedule with new interval
-		wp_schedule_event(time(), 'every_two_hours', 'bank_transfer_cron_event');
+		wp_schedule_event(time(), BANK_TRANSFER_CRON_INTERVAL, BANK_TRANSFER_CRON_HOOK);
 	}
 
 	function deactivate_cron_job()
 	{
 		Bank_Transfer_Payment_Gateway_Logger::info('Automatic payment status checks have been disabled.', ['source' => 'bank-transfer-payment-gateway']);
-		wp_clear_scheduled_hook('bank_transfer_cron_event');
+		wp_clear_scheduled_hook(BANK_TRANSFER_CRON_HOOK);
+		wp_clear_scheduled_hook(BANK_TRANSFER_ASYNC_SYNC_HOOK);
 	}
 
 
+	/**
+	 * Refresh the configured accounts' statuses from RT and reconcile the
+	 * orders still waiting for payment.
+	 *
+	 * BK-10: the secret keys never leave the shop. Each account proves its
+	 * secret with a signature over "<timestamp>.<public_key>".
+	 */
 	public function handle_cron_event()
 	{
 		$logger_context = ['source' => 'bank-transfer-payment-gateway'];
 
-		$accounts = get_option('woocommerce_bank_transfer_payment_gateway_accounts');
-		if (is_string($accounts)) {
-			$unserialized = maybe_unserialize($accounts);
-			$accounts = is_array($unserialized) ? $unserialized : [];
-		}
+		$accounts = bank_transfer_get_accounts();
 
-		if (!$accounts || !is_array($accounts)) {
+		if (empty($accounts)) {
 			Bank_Transfer_Payment_Gateway_Logger::warning('No payment accounts found or the account format is invalid. Sync aborted.', $logger_context);
 			return [];
 		}
 
 		$accountsData = [];
-		$first_public_key = '';
-		$first_secret_key = '';
+		$updated      = false;
 
 		foreach ($accounts as &$account) {
 			$isSandboxEnabled = isset($account['has_sandbox']) && $account['has_sandbox'] === 'on';
 
 			// Prepare both live and sandbox entries
-			if (!empty($account['live_public_key'])) {
-				$accountsData[] = [
+			if (!empty($account['live_public_key']) && !empty($account['live_secret_key'])) {
+				$accountsData[] = array_merge([
 					'account_name' => $account['title'] ?? '',
 					'public_key'   => $account['live_public_key'],
-					'secret_key'   => $account['live_secret_key'] ?? '',
 					'mode'         => 'live',
-				];
-				if (empty($first_public_key)) {
-					$first_public_key = $account['live_public_key'];
-					$first_secret_key = $account['live_secret_key'] ?? '';
-				}
+				], bank_transfer_account_signature($account['live_public_key'], $account['live_secret_key']));
 			}
 
 			if ($isSandboxEnabled) {
 				if (!empty($account['sandbox_public_key']) && !empty($account['sandbox_secret_key'])) {
-					$accountsData[] = [
+					$accountsData[] = array_merge([
 						'account_name' => $account['title'] ?? '',
 						'public_key'   => $account['sandbox_public_key'],
-						'secret_key'   => $account['sandbox_secret_key'] ?? '',
 						'mode'         => 'sandbox',
-					];
-					if (empty($first_public_key)) {
-						$first_public_key = $account['sandbox_public_key'];
-						$first_secret_key = $account['sandbox_secret_key'] ?? '';
-					}
+					], bank_transfer_account_signature($account['sandbox_public_key'], $account['sandbox_secret_key']));
 				} else {
 					if (($account['sandbox_status'] ?? '') !== 'invalid') {
 						$account['sandbox_status'] = 'invalid';
@@ -1147,28 +525,21 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 				}
 			}
 		}
+		unset($account);
 
 		if (empty($accountsData)) {
 			Bank_Transfer_Payment_Gateway_Logger::warning('No valid credentials found in any payment account. Sync skipped.', $logger_context);
 			return [];
 		}
 
-		$url = esc_url($this->get_api_url('/sync-account-status'));
-		$body = wp_json_encode(['accounts' => $accountsData]);
-		$headers = [
-			'Content-Type'  => 'application/json',
-			'Authorization' => 'Bearer ' . sanitize_text_field($first_public_key),
-		];
-
-		if (!empty($first_secret_key)) {
-			$timestamp = time();
-			$signature = hash_hmac('sha256', $timestamp . '.' . $body, $first_secret_key);
-			$headers['X-Signature'] = $signature;
-			$headers['X-Timestamp'] = (string) $timestamp;
-		}
+		$url  = esc_url($this->get_api_url('/sync-account-status'));
+		$body = wp_json_encode(['accounts' => array_slice($accountsData, 0, 10)]);
 
 		$response = wp_remote_post($url, [
-			'headers'   => $headers,
+			'headers'   => [
+				'Content-Type' => 'application/json',
+				'Accept'       => 'application/json',
+			],
 			'body'      => $body,
 			'timeout'   => 15,
 			'sslverify' => true,
@@ -1198,7 +569,6 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		$response_body = wp_remote_retrieve_body($response);
 		$response_data = json_decode($response_body, true);
 
-		$updated = false;
 		$statusSummary = [];
 
 		if (!empty($response_data['data'])) {
@@ -1211,7 +581,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 					foreach ($accounts as &$account) {
 						if (
 							$statusData['mode'] === 'live' &&
-							$account['live_public_key'] === $statusData['public_key']
+							($account['live_public_key'] ?? '') === $statusData['public_key']
 						) {
 							$account['live_status'] = $statusData['status'];
 							$updated = true;
@@ -1224,7 +594,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 
 						if (
 							$statusData['mode'] === 'sandbox' &&
-							$account['sandbox_public_key'] === $statusData['public_key']
+							($account['sandbox_public_key'] ?? '') === $statusData['public_key']
 						) {
 							$account['sandbox_status'] = $statusData['status'];
 							$updated = true;
@@ -1235,13 +605,14 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 							];
 						}
 					}
+					unset($account);
 				}
 			}
 		}
 
 		if (!empty($statusSummary)) {
 			if ($updated) {
-				update_option('woocommerce_bank_transfer_payment_gateway_accounts', $accounts);
+				update_option(BANK_TRANSFER_ACCOUNTS_OPTION, $accounts);
 
 				Bank_Transfer_Payment_Gateway_Logger::info('Payment account statuses were successfully updated after syncing.', [
 					'source'  => 'bank-transfer-payment-gateway',
@@ -1317,16 +688,19 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		wp_die(); // Always include this
 	}
 
+	/**
+	 * Tell RT the plugin's state (installed, enabled, versions). Sends public
+	 * keys only. BK-17: nothing is sent before the merchant has entered keys.
+	 */
 	public function bank_transfer_send_plugin_status($plugin_status, $gateway_loaded)
 	{
-		$accounts = get_option('woocommerce_bank_transfer_payment_gateway_accounts', []);
-
-		if (is_string($accounts)) {
-			$unserialized = maybe_unserialize($accounts);
-			$accounts = is_array($unserialized) ? $unserialized : [];
+		if (!bank_transfer_is_configured()) {
+			return;
 		}
 
-		if (empty($accounts) || !is_array($accounts)) {
+		$accounts = bank_transfer_get_accounts();
+
+		if (empty($accounts)) {
 			return;
 		}
 
@@ -1417,11 +791,11 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	 * ========================================================= */
 
 	/**
-	 * Resolve the Rethink Pay payment id (pay_id / UUID) for an order.
+	 * Resolve the RT payment id (pay_id / UUID) for an order.
 	 *
 	 * Order meta is the primary source. When it is empty (older orders, a
 	 * create-link response without pay_id, or meta lost on a retry) fall back to
-	 * the active pay id and to the order_payment_link table, including the id
+	 * the active pay id and to the payment link table, including the id
 	 * embedded in the stored payment link. A resolved id is written back to the
 	 * order so webhooks and later checks find it immediately.
 	 *
@@ -1466,7 +840,9 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	}
 
 	/**
-	 * Every payment id this order is known under (meta, active id, link table).
+	 * Every payment id this order is known under: current meta, active id,
+	 * the link table and the history of every link created for the order
+	 * (BK-04: a webhook for an earlier link must still be recognised).
 	 *
 	 * @param WC_Order $order
 	 * @return string[]
@@ -1482,6 +858,13 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			sanitize_text_field((string) $order->get_meta('_bank_transfer_active_pay_id')),
 		];
 
+		$history = $order->get_meta('_bank_transfer_pay_id_history');
+		if (is_array($history)) {
+			foreach ($history as $entry) {
+				$ids[] = sanitize_text_field((string) (is_array($entry) ? ($entry['pay_id'] ?? '') : $entry));
+			}
+		}
+
 		$link_row = $this->bank_transfer_get_order_payment_link_row($order->get_id());
 		if (is_array($link_row)) {
 			$ids[] = sanitize_text_field((string) ($link_row['uuid'] ?? ''));
@@ -1494,7 +877,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	}
 
 	/**
-	 * Read the order_payment_link row written by process_payment().
+	 * Read the payment link row written by process_payment().
 	 *
 	 * @param int $order_id
 	 * @return array|null
@@ -1515,7 +898,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			return $cached;
 		}
 
-		$table_name = esc_sql($wpdb->prefix . 'order_payment_link');
+		$table_name = esc_sql(bank_transfer_table_name());
 
 		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$table_exists = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', $table_name));
@@ -1538,7 +921,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	}
 
 	/**
-	 * Extract a pay id from a Rethink Pay payment link
+	 * Extract a pay id from an RT payment link
 	 * (https://host/p/{id}, https://host/p/t/{id} or ?uuid= / ?pay_id=).
 	 *
 	 * @param string $url
@@ -1563,125 +946,69 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	 * ========================================================= */
 
 	/**
-	 * Ask the Rethink Pay backend for the current status of a payment.
+	 * Ask the RT backend for the current status of a payment:
+	 * GET /payment-requests/public/{pay_id}/status, with the public key as
+	 * bearer and X-Signature = HMAC-SHA256(secret_key, X-Timestamp . '.' . pay_id).
 	 *
-	 * 1. PRIMARY  GET  /payment-requests/public/{pay_id}/status
-	 *             Authorization: Bearer {public_key}
-	 *             X-Signature = HMAC-SHA256(secret_key, X-Timestamp . '.' . pay_id)
-	 * 2. FALLBACK POST /update-txn-status (order_id + payment_token)
-	 *             X-Signature = HMAC-SHA256(secret_key, X-Timestamp . '.' . raw_body)
-	 *
-	 * The secret key is only ever used to sign; it is never sent in a body.
+	 * BK-05: a lookup needs the stored pay_id. There is no lookup by order
+	 * number alone, and the secret key is only ever used to sign.
 	 *
 	 * @param WC_Order $order
 	 * @param string   $pay_id
 	 * @param array    $creds  ['public_key' => , 'secret_key' => , 'is_sandbox' => ]
 	 * @return array{response: array|WP_Error|null, data: array|null, http_code: int, endpoint: string}
 	 *               'data' is the decoded payload when a usable status came back, else null.
-	 *               'response' / 'http_code' describe the response the caller should report.
 	 */
 	public function bank_transfer_fetch_remote_payment_status($order, $pay_id, $creds)
 	{
 		$public_key = (string) ($creds['public_key'] ?? '');
 		$secret_key = (string) ($creds['secret_key'] ?? '');
-		$is_sandbox = (int) ($creds['is_sandbox'] ?? 0);
 		$order_id   = $order instanceof WC_Order ? $order->get_id() : 0;
 		$pay_id     = sanitize_text_field((string) $pay_id);
 
-		$result = ['response' => null, 'data' => null, 'http_code' => 0, 'endpoint' => ''];
+		$result = ['response' => null, 'data' => null, 'http_code' => 0, 'endpoint' => 'payment-requests/status'];
 
 		if ($public_key === '' || $secret_key === '') {
 			$result['response'] = new WP_Error('bank_transfer_missing_credentials', 'Missing merchant account credentials.');
 			return $result;
 		}
 
-		// -------------------------
-		// 1. PRIMARY: signed payment-request status
-		// -------------------------
-		if ($pay_id !== '') {
-			$timestamp = (string) time();
-			$response  = wp_remote_get(
-				esc_url_raw($this->get_api_url('/payment-requests/public/' . rawurlencode($pay_id) . '/status')),
-				[
-					'headers'   => [
-						'Accept'        => 'application/json',
-						'Authorization' => 'Bearer ' . sanitize_text_field($public_key),
-						'X-Timestamp'   => $timestamp,
-						'X-Signature'   => hash_hmac('sha256', $timestamp . '.' . $pay_id, $secret_key),
-					],
-					'timeout'   => 10,
-					'sslverify' => true,
-				]
-			);
-
-			$result['response']  = $response;
-			$result['endpoint']  = 'payment-requests/status';
-			$result['http_code'] = is_wp_error($response) ? 0 : (int) wp_remote_retrieve_response_code($response);
-
-			if (!is_wp_error($response) && $result['http_code'] >= 200 && $result['http_code'] < 300) {
-				$decoded = $this->bank_transfer_unwrap_status_payload(json_decode(wp_remote_retrieve_body($response), true));
-				if (is_array($decoded) && $this->bank_transfer_payload_has_status($decoded)) {
-					$result['data'] = $decoded;
-					return $result;
-				}
-			}
-
-			Bank_Transfer_Payment_Gateway_Logger::info(
-				"[Order #{$order_id}] Status lookup | payment-requests/status gave no usable status (" .
-				(is_wp_error($response) ? $response->get_error_message() : 'HTTP ' . $result['http_code']) .
-				'); trying update-txn-status',
-				['source' => 'bank-transfer-payment-gateway']
-			);
+		if ($pay_id === '') {
+			$result['response'] = new WP_Error('bank_transfer_missing_pay_id', 'No payment id recorded for this order.');
+			return $result;
 		}
 
-		// -------------------------
-		// 2. FALLBACK: update-txn-status
-		// -------------------------
-		$body      = wp_json_encode([
-			'order_id'       => $order_id,
-			'payment_token'  => $pay_id,
-			'is_sandbox'     => $is_sandbox,
-			'api_public_key' => $public_key,
-		]);
 		$timestamp = (string) time();
-		$response  = wp_remote_post(
-			$this->get_api_url('/api/update-txn-status'),
+		$response  = wp_remote_get(
+			esc_url_raw($this->get_api_url('/payment-requests/public/' . rawurlencode($pay_id) . '/status')),
 			[
-				'method'    => 'POST',
-				'body'      => $body,
 				'headers'   => [
-					'Content-Type'  => 'application/json',
 					'Accept'        => 'application/json',
 					'Authorization' => 'Bearer ' . sanitize_text_field($public_key),
 					'X-Timestamp'   => $timestamp,
-					'X-Signature'   => hash_hmac('sha256', $timestamp . '.' . $body, $secret_key),
+					'X-Signature'   => hash_hmac('sha256', $timestamp . '.' . $pay_id, $secret_key),
 				],
-				'timeout'   => 15,
+				'timeout'   => 10,
 				'sslverify' => true,
 			]
 		);
 
-		$fallback_code = is_wp_error($response) ? 0 : (int) wp_remote_retrieve_response_code($response);
+		$result['response']  = $response;
+		$result['http_code'] = is_wp_error($response) ? 0 : (int) wp_remote_retrieve_response_code($response);
 
-		if (!is_wp_error($response) && $fallback_code >= 200 && $fallback_code < 300) {
+		if (!is_wp_error($response) && $result['http_code'] >= 200 && $result['http_code'] < 300) {
 			$decoded = $this->bank_transfer_unwrap_status_payload(json_decode(wp_remote_retrieve_body($response), true));
 			if (is_array($decoded) && $this->bank_transfer_payload_has_status($decoded)) {
-				$result['response']  = $response;
-				$result['http_code'] = $fallback_code;
-				$result['endpoint']  = 'update-txn-status';
-				$result['data']      = $decoded;
+				$result['data'] = $decoded;
 				return $result;
 			}
 		}
 
-		// Neither endpoint produced a usable status. Report the fallback response,
-		// unless the primary endpoint already answered with an auth / rate-limit
-		// error, which is the more useful thing to surface.
-		if (!in_array($result['http_code'], [401, 403, 429], true)) {
-			$result['response']  = $response;
-			$result['http_code'] = $fallback_code;
-			$result['endpoint']  = 'update-txn-status';
-		}
+		Bank_Transfer_Payment_Gateway_Logger::info(
+			"[Order #{$order_id}] Status lookup | payment-requests/status gave no usable status (" .
+			(is_wp_error($response) ? $response->get_error_message() : 'HTTP ' . $result['http_code']) . ')',
+			['source' => 'bank-transfer-payment-gateway']
+		);
 
 		return $result;
 	}
@@ -1725,8 +1052,13 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	/**
 	 * Map a raw backend status payload to the state-engine vocabulary.
 	 *
+	 * The request-level payment_status decides: "success" only once the ACH
+	 * debit completed (funds settled, BK-02); "pending" while the link is open.
+	 * A pending request whose transaction is "processing" means the customer
+	 * authorised the debit and it is in flight.
+	 *
 	 * @param array|null $data
-	 * @return string|null 'success' | 'failed' | 'cancelled' | 'expired' | 'processing' | raw unknown value | null
+	 * @return string|null 'success' | 'failed' | 'cancelled' | 'expired' | 'processing' | 'pending' | 'returned' | null
 	 */
 	public function bank_transfer_normalize_remote_status($data)
 	{
@@ -1735,31 +1067,30 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			return null;
 		}
 
-		$raw = $data['payment_status']
-			?? $data['transaction_status']
-			?? ($data['transaction']['status'] ?? null);
-		$raw = is_string($raw) ? strtolower(trim($raw)) : '';
+		$payment_status = $data['payment_status'] ?? null;
+		$txn_status     = $data['transaction_status'] ?? ($data['transaction']['status'] ?? null);
 
 		$settled = isset($data['settled']) && filter_var($data['settled'], FILTER_VALIDATE_BOOLEAN);
-		$failed  = isset($data['failed'])  && filter_var($data['failed'],  FILTER_VALIDATE_BOOLEAN);
-
-		if ($settled || in_array($raw, ['success', 'paid', 'completed', 'settled', 'succeeded'], true)) {
+		if ($settled) {
 			return 'success';
 		}
-		if ($failed || $raw === 'failed') {
-			return 'failed';
-		}
-		if (in_array($raw, ['cancelled', 'canceled'], true)) {
-			return 'cancelled';
-		}
-		if ($raw === 'expired') {
-			return 'expired';
-		}
-		if (in_array($raw, ['pending', 'processing', 'initiated', 'created', 'open', 'awaiting'], true)) {
+
+		$mapped = is_string($payment_status) ? BANK_TRANSFER_PAYMENT_ENGINE::map_status($payment_status) : null;
+		$txn    = is_string($txn_status) ? BANK_TRANSFER_PAYMENT_ENGINE::map_status($txn_status) : null;
+
+		if ($mapped === 'pending' && $txn === 'processing') {
 			return 'processing';
 		}
+		if ($mapped !== null) {
+			return $mapped;
+		}
 
-		return $raw !== '' ? $raw : null;
+		$failed = isset($data['failed']) && filter_var($data['failed'], FILTER_VALIDATE_BOOLEAN);
+		if ($failed) {
+			return 'failed';
+		}
+
+		return $txn;
 	}
 
 	/* =========================================================
@@ -1767,89 +1098,68 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	 * ========================================================= */
 
 	/**
-	 * Sync all pending Bank Transfer orders with the remote payment API.
+	 * Ask RT for an order's status and apply it to the order through the one
+	 * shared validation (BK-05) and the state engine. Used by the customer
+	 * status polls, the customer return, the admin action and the cron.
 	 *
-	 * @param int $limit Max number of pending orders to check per run.
-	 * @return array Summary of synced order states keyed by order id.
+	 * @param WC_Order $order
+	 * @param string   $event_type Engine event type ('api_sync', 'popup_close', 'redirect_check').
+	 * @return array{state: string|null, error: string|null, http_code: int, reason: string|null}
 	 */
-	public function sync_pending_orders($limit = 20)
+	public function bank_transfer_refresh_order_from_remote($order, $event_type = 'api_sync')
 	{
-		if (!function_exists('wc_get_orders')) {
-			return [];
-		}
-
-		$orders = wc_get_orders([
-			'status'         => ['pending', 'on-hold'],
-			'payment_method' => 'bank_transfer',
-			'limit'          => absint($limit),
-			'orderby'        => 'date',
-			'order'          => 'DESC',
-		]);
-
-		$synced = [];
-		if (!empty($orders) && is_array($orders)) {
-			foreach ($orders as $order) {
-				if (!$order instanceof WC_Order) {
-					continue;
-				}
-				$last_attempt = (int) $order->get_meta('_bank_transfer_last_sync_attempt');
-				if ($last_attempt > 0 && (time() - $last_attempt) < 15) {
-					continue;
-				}
-				$order->update_meta_data('_bank_transfer_last_sync_attempt', time());
-				$order->save();
-
-				$result = $this->sync_single_order_status($order);
-				if ($result) {
-					$synced[$order->get_id()] = $result;
-				}
-			}
-		}
-
-		return $synced;
-	}
-
-	/**
-	 * Sync a single Bank Transfer order with the remote payment API and push the
-	 * outcome through the state engine.
-	 *
-	 * @param WC_Order|int $order Order instance or order ID.
-	 * @return string|null 'success', 'failed', 'cancelled', 'expired', 'processing' or null when nothing usable came back.
-	 */
-	public function sync_single_order_status($order)
-	{
-		if (is_numeric($order)) {
-			$order = wc_get_order(absint($order));
-		}
-
-		if (!$order instanceof WC_Order || $order->get_payment_method() !== 'bank_transfer') {
-			return null;
-		}
-
-		if ($order->has_status(['processing', 'completed']) || $order->get_meta('_bank_transfer_state') === 'success') {
-			return 'success';
-		}
-
 		$order_id   = $order->get_id();
 		$log_prefix = "[Order #{$order_id}] Sync |";
 		$ctx        = ['source' => 'bank-transfer-payment-gateway'];
+		$out        = ['state' => null, 'error' => null, 'http_code' => 0, 'reason' => null];
 
 		$pay_id = $this->bank_transfer_resolve_order_pay_id($order);
 		$creds  = $this->get_order_account_credentials($order);
 
 		if (empty($creds['public_key']) || empty($creds['secret_key'])) {
 			Bank_Transfer_Payment_Gateway_Logger::warning("{$log_prefix} Missing API credentials for merchant account", $ctx);
-			return null;
+			$out['error']  = 'Missing merchant account credentials.';
+			$out['reason'] = 'credentials';
+			$out['http_code'] = 400;
+			return $out;
+		}
+
+		if ($pay_id === '') {
+			Bank_Transfer_Payment_Gateway_Logger::warning("{$log_prefix} No payment id recorded; status cannot be verified", $ctx);
+			$out['error']  = 'No payment id recorded for this order.';
+			$out['reason'] = 'no_pay_id';
+			$out['http_code'] = 400;
+			return $out;
 		}
 
 		$lookup = $this->bank_transfer_fetch_remote_payment_status($order, $pay_id, $creds);
+		$out['http_code'] = (int) $lookup['http_code'];
+
+		if (is_wp_error($lookup['response'])) {
+			$out['error']  = 'API connection failed.';
+			$out['reason'] = 'network';
+			return $out;
+		}
+
+		if ($out['http_code'] === 401 || $out['http_code'] === 403) {
+			$out['error']  = 'API authentication failed. Please verify merchant credentials.';
+			$out['reason'] = 'auth';
+			return $out;
+		}
+
+		if ($out['http_code'] === 429) {
+			$out['error']  = 'Rate limit exceeded. Please wait a moment.';
+			$out['reason'] = 'rate_limit';
+			return $out;
+		}
 
 		if (!is_array($lookup['data'])) {
-			$why = is_wp_error($lookup['response'])
-				? $lookup['response']->get_error_message()
-				: 'HTTP ' . (int) $lookup['http_code'];
-			Bank_Transfer_Payment_Gateway_Logger::info("{$log_prefix} No usable status from backend ({$why})", $ctx);
-			return null;
+			Bank_Transfer_Payment_Gateway_Logger::info("{$log_prefix} No usable status from backend (HTTP {$out['http_code']})", $ctx);
+			if ($out['http_code'] < 200 || $out['http_code'] >= 300) {
+				$out['error']  = 'Unable to check transaction status at this time.';
+				$out['reason'] = 'upstream';
+			}
+			return $out;
 		}
 
 		$status_data = $lookup['data'];
@@ -1866,70 +1176,139 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			array_merge($ctx, ['pay_id' => $pay_id])
 		);
 
+		$out['state'] = $state;
+
+		if ($state === null) {
+			return $out;
+		}
+
 		if ($state === 'success') {
 			// The backend confirms money arrived. Before touching the order make sure
-			// the payment really belongs to it (same checks the webhook performs).
-			$raw_order_id = $status_data['order_id'] ?? ($status_data['meta_data']['order_id'] ?? null);
-			if ($raw_order_id !== null && $raw_order_id !== '' && is_numeric($raw_order_id) && (int) $raw_order_id !== (int) $order_id) {
-				Bank_Transfer_Payment_Gateway_Logger::warning(
-					"{$log_prefix} order_id mismatch: expected {$order_id}, backend returned " . sanitize_text_field((string) $raw_order_id),
-					$ctx
-				);
-				return null;
+			// the payment really belongs to it: the same check the webhook performs.
+			$claim = bank_transfer_verify_payment_claim($order, $status_data, $pay_id, $this->bank_transfer_known_order_pay_ids($order));
+			if (is_wp_error($claim)) {
+				$this->bank_transfer_note_sync_mismatch($order, $claim->get_error_message());
+				$out['state']  = null;
+				$out['reason'] = 'claim_mismatch';
+				return $out;
 			}
+		}
 
-			$raw_currency = $status_data['currency'] ?? ($status_data['curr_code'] ?? null);
-			if (!empty($raw_currency) && is_string($raw_currency)) {
-				$api_currency   = strtoupper(trim(sanitize_text_field($raw_currency)));
-				$order_currency = strtoupper(trim((string) $order->get_currency()));
-				if ($api_currency !== $order_currency) {
-					$this->bank_transfer_note_sync_mismatch($order, "currency {$order_currency} vs backend {$api_currency}");
-					return null;
+		if ($state === 'returned') {
+			// Only a signed RT webhook may move a paid order to returned (BK-01).
+			return $out;
+		}
+
+		$result = BANK_TRANSFER_PAYMENT_ENGINE::handle_event(
+			$order_id,
+			$event_type,
+			[
+				'status'        => $state,
+				'payment_token' => $pay_id,
+				'source'        => 'API Sync',
+			]
+		);
+
+		Bank_Transfer_Payment_Gateway_Logger::info("{$log_prefix} Engine result: " . wp_json_encode($result), $ctx);
+
+		return $out;
+	}
+
+	/**
+	 * Sync every open Bank Transfer order with the remote payment API, in
+	 * pages, within a time budget (BK-17: not just the newest 20).
+	 *
+	 * @param int $max_orders Upper bound of orders checked in this run.
+	 * @param int $time_budget Seconds this run may spend.
+	 * @return array Summary of synced order states keyed by order id.
+	 */
+	public function sync_pending_orders($max_orders = 300, $time_budget = 20)
+	{
+		if (!function_exists('wc_get_orders')) {
+			return [];
+		}
+
+		$started   = microtime(true);
+		$page_size = 25;
+		$synced    = [];
+		$seen      = 0;
+
+		foreach (bank_transfer_gateway_ids() as $gateway_id) {
+			$page = 1;
+			while ($seen < $max_orders && (microtime(true) - $started) < $time_budget) {
+				$orders = wc_get_orders([
+					'status'         => ['pending', 'on-hold'],
+					'payment_method' => $gateway_id,
+					'limit'          => $page_size,
+					'page'           => $page,
+					'orderby'        => 'date',
+					'order'          => 'ASC',
+					'date_created'   => '>' . (time() - 30 * DAY_IN_SECONDS),
+				]);
+
+				if (empty($orders) || !is_array($orders)) {
+					break;
 				}
-			}
 
-			$raw_amount = $status_data['amount'] ?? ($status_data['total_amount'] ?? null);
-			if ($raw_amount !== null && $raw_amount !== '' && is_numeric($raw_amount)) {
-				$api_amount   = (float) $raw_amount;
-				$order_amount = (float) $order->get_total();
-				if (abs($api_amount - $order_amount) > 0.05) {
-					$this->bank_transfer_note_sync_mismatch($order, "amount {$order_amount} vs backend {$api_amount}");
-					return null;
+				foreach ($orders as $order) {
+					if (!$order instanceof WC_Order) {
+						continue;
+					}
+					$seen++;
+					if ($seen > $max_orders || (microtime(true) - $started) >= $time_budget) {
+						break 2;
+					}
+					$last_attempt = (int) $order->get_meta('_bank_transfer_last_sync_attempt');
+					if ($last_attempt > 0 && (time() - $last_attempt) < 15) {
+						continue;
+					}
+					$order->update_meta_data('_bank_transfer_last_sync_attempt', time());
+					$order->save();
+
+					$result = $this->sync_single_order_status($order);
+					if ($result) {
+						$synced[$order->get_id()] = $result;
+					}
 				}
+
+				if (count($orders) < $page_size) {
+					break;
+				}
+				$page++;
 			}
+		}
 
-			$result = BANK_TRANSFER_PAYMENT_ENGINE::handle_event(
-				$order_id,
-				'api_sync',
-				[
-					'status'        => 'success',
-					'payment_token' => $pay_id,
-					'source'        => 'API Sync',
-				]
-			);
+		return $synced;
+	}
 
-			Bank_Transfer_Payment_Gateway_Logger::info("{$log_prefix} Engine result: " . wp_json_encode($result), $ctx);
+	/**
+	 * Sync a single Bank Transfer order with the remote payment API and push the
+	 * outcome through the state engine.
+	 *
+	 * @param WC_Order|int $order Order instance or order ID.
+	 * @return string|null 'success', 'failed', 'cancelled', 'expired', 'processing', 'pending' or null when nothing usable came back.
+	 */
+	public function sync_single_order_status($order)
+	{
+		if (is_numeric($order)) {
+			$order = wc_get_order(absint($order));
+		}
 
+		if (!$order instanceof WC_Order || !bank_transfer_is_gateway_order($order)) {
+			return null;
+		}
+
+		if ($order->has_status(['processing', 'completed']) || $order->get_meta('_bank_transfer_state') === 'success') {
 			return 'success';
 		}
 
-		if (in_array($state, ['failed', 'cancelled', 'expired'], true)) {
-			$result = BANK_TRANSFER_PAYMENT_ENGINE::handle_event(
-				$order_id,
-				'api_sync',
-				[
-					'status'        => $state,
-					'payment_token' => $pay_id,
-					'source'        => 'API Sync',
-				]
-			);
-
-			Bank_Transfer_Payment_Gateway_Logger::info("{$log_prefix} Engine result: " . wp_json_encode($result), $ctx);
-
-			return $state;
+		if ($order->has_status([BANK_TRANSFER_RETURNED_STATUS])) {
+			return 'returned';
 		}
 
-		return 'processing';
+		$outcome = $this->bank_transfer_refresh_order_from_remote($order, 'api_sync');
+
+		return $outcome['state'] ?? null;
 	}
 
 	/**
@@ -1938,7 +1317,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	private function bank_transfer_note_sync_mismatch($order, $detail)
 	{
 		Bank_Transfer_Payment_Gateway_Logger::warning(
-			'[Order #' . $order->get_id() . '] Sync | Backend reports paid but ' . $detail . '. Order left unchanged for manual review.',
+			'[Order #' . $order->get_id() . '] Sync | Backend reports paid but ' . $detail . ' Order left unchanged for manual review.',
 			['source' => 'bank-transfer-payment-gateway']
 		);
 
@@ -1959,26 +1338,51 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	 * ========================================================= */
 
 	/**
-	 * Auto-sync when an admin opens a pending order's edit screen.
+	 * BK-14: queue a status refresh for an order instead of calling RT while
+	 * an admin page renders. Action Scheduler when WooCommerce provides it,
+	 * else a WP-Cron single event (WordPress de-duplicates identical events).
+	 *
+	 * @param int $order_id
+	 */
+	public function bank_transfer_schedule_async_sync($order_id)
+	{
+		$order_id = absint($order_id);
+		if ($order_id <= 0) {
+			return;
+		}
+		if (function_exists('as_enqueue_async_action')) {
+			if (function_exists('as_has_scheduled_action') && as_has_scheduled_action(BANK_TRANSFER_ASYNC_SYNC_HOOK, [$order_id], 'rt-bank-transfer')) {
+				return;
+			}
+			as_enqueue_async_action(BANK_TRANSFER_ASYNC_SYNC_HOOK, [$order_id], 'rt-bank-transfer');
+			return;
+		}
+		if (!wp_next_scheduled(BANK_TRANSFER_ASYNC_SYNC_HOOK, [$order_id])) {
+			wp_schedule_single_event(time(), BANK_TRANSFER_ASYNC_SYNC_HOOK, [$order_id]);
+		}
+	}
+
+	/**
+	 * Queue a refresh when an admin opens a pending order's edit screen.
 	 *
 	 * @param WC_Order $order
 	 */
 	public function bank_transfer_admin_order_sync_on_view($order)
 	{
-		if (!$order instanceof WC_Order || $order->get_payment_method() !== 'bank_transfer') {
+		if (!$order instanceof WC_Order || !bank_transfer_is_gateway_order($order)) {
 			return;
 		}
 		if (!$order->has_status(['pending', 'on-hold'])) {
 			return;
 		}
 		$last_sync = (int) $order->get_meta('_bank_transfer_last_admin_sync');
-		if (time() - $last_sync < 15) {
+		if (time() - $last_sync < 60) {
 			return;
 		}
 		$order->update_meta_data('_bank_transfer_last_admin_sync', time());
 		$order->save();
 
-		$this->sync_single_order_status($order);
+		$this->bank_transfer_schedule_async_sync($order->get_id());
 	}
 
 	/**
@@ -1994,20 +1398,21 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 			global $theorder;
 			$order = $theorder;
 		}
-		if ($order instanceof WC_Order && $order->get_payment_method() === 'bank_transfer') {
+		if ($order instanceof WC_Order && bank_transfer_is_gateway_order($order)) {
 			$actions['bank_transfer_check_status'] = __('Check Bank Transfer payment status', 'bank-transfer-payment-gateway');
 		}
 		return $actions;
 	}
 
 	/**
-	 * Handle the manual "check status" order action.
+	 * Handle the manual "check status" order action (admin-initiated, so this
+	 * one call to RT is synchronous).
 	 *
 	 * @param WC_Order $order
 	 */
 	public function bank_transfer_process_order_action_check_status($order)
 	{
-		if (!$order instanceof WC_Order || $order->get_payment_method() !== 'bank_transfer') {
+		if (!$order instanceof WC_Order || !bank_transfer_is_gateway_order($order)) {
 			return;
 		}
 
@@ -2024,7 +1429,8 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	}
 
 	/**
-	 * Auto-sync pending orders when an admin loads the Orders list screen.
+	 * Queue a refresh of the open orders when an admin loads the Orders list
+	 * (throttled; nothing is fetched during the render).
 	 *
 	 * @param WP_Screen|null $screen
 	 */
@@ -2038,14 +1444,9 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		// phpcs:disable WordPress.Security.NonceVerification.Recommended
 		$page      = isset($_GET['page']) ? sanitize_text_field(wp_unslash($_GET['page'])) : '';
 		$post_type = isset($_GET['post_type']) ? sanitize_text_field(wp_unslash($_GET['post_type'])) : '';
+		$edit_id   = isset($_GET['id']) ? absint($_GET['id']) : (isset($_GET['post']) ? absint($_GET['post']) : 0);
 		// phpcs:enable WordPress.Security.NonceVerification.Recommended
 
-		// Single order edit screen (HPOS: ?page=wc-orders&action=edit&id=N, classic:
-		// post.php?post=N). Refresh that order before the page renders so the status
-		// WooCommerce prints is already the settled one, not the stale pending state.
-		// phpcs:disable WordPress.Security.NonceVerification.Recommended
-		$edit_id = isset($_GET['id']) ? absint($_GET['id']) : (isset($_GET['post']) ? absint($_GET['post']) : 0);
-		// phpcs:enable WordPress.Security.NonceVerification.Recommended
 		if ($edit_id > 0 && ($page === 'wc-orders' || $post_type === 'shop_order' || in_array($screen_id, ['shop_order', 'post', 'woocommerce_page_wc-orders'], true))) {
 			$edit_order = wc_get_order($edit_id);
 			if ($edit_order instanceof WC_Order) {
@@ -2063,50 +1464,24 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 		}
 
 		$last_screen_sync = (int) get_transient('bank_transfer_last_orders_screen_sync');
-		if (time() - $last_screen_sync >= 10) {
-			set_transient('bank_transfer_last_orders_screen_sync', time(), 30);
-			$this->sync_pending_orders(10);
+		if (time() - $last_screen_sync < 60) {
+			return;
 		}
-	}
+		set_transient('bank_transfer_last_orders_screen_sync', time(), 120);
 
-	/**
-	 * Auto-sync a pending order while its row renders in the HPOS orders table.
-	 */
-	public function bank_transfer_admin_order_row_filter($classes, $order)
-	{
-		if ($order instanceof WC_Order) {
-			$this->bank_transfer_maybe_sync_order_row($order);
-		}
-		return $classes;
-	}
-
-	/**
-	 * Auto-sync a pending order while its row renders in the classic (posts) orders table.
-	 */
-	public function bank_transfer_admin_post_class_filter($classes, $class, $post_id)
-	{
-		if (is_admin() && get_post_type($post_id) === 'shop_order') {
-			$order = wc_get_order($post_id);
-			if ($order instanceof WC_Order) {
-				$this->bank_transfer_maybe_sync_order_row($order);
+		foreach (bank_transfer_gateway_ids() as $gateway_id) {
+			$orders = wc_get_orders([
+				'status'         => ['pending', 'on-hold'],
+				'payment_method' => $gateway_id,
+				'limit'          => 20,
+				'orderby'        => 'date',
+				'order'          => 'DESC',
+				'return'         => 'ids',
+			]);
+			foreach ((array) $orders as $order_id) {
+				$this->bank_transfer_schedule_async_sync($order_id);
 			}
 		}
-		return $classes;
-	}
-
-	private function bank_transfer_maybe_sync_order_row($order)
-	{
-		if ($order->get_payment_method() !== 'bank_transfer' || !$order->has_status(['pending', 'on-hold'])) {
-			return;
-		}
-		$last_sync = (int) $order->get_meta('_bank_transfer_last_row_sync');
-		if (time() - $last_sync < 10) {
-			return;
-		}
-		$order->update_meta_data('_bank_transfer_last_row_sync', time());
-		$order->save();
-
-		$this->sync_single_order_status($order);
 	}
 
 	/**
@@ -2119,7 +1494,7 @@ class BANK_TRANSFER_PAYMENT_GATEWAY_Loader
 	public function bank_transfer_customer_order_sync($order_id)
 	{
 		$order = wc_get_order($order_id);
-		if (!$order instanceof WC_Order || $order->get_payment_method() !== 'bank_transfer') {
+		if (!$order instanceof WC_Order || !bank_transfer_is_gateway_order($order)) {
 			return;
 		}
 		if (!$order->has_status(['pending', 'on-hold'])) {
