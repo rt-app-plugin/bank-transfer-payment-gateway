@@ -46,33 +46,34 @@ class BANK_TRANSFER_Blocks_Gateway extends AbstractPaymentMethodType {
 		$blocks_js_ver  = file_exists($blocks_js_path) ? filemtime($blocks_js_path) : bank_transfer_get_plugin_version();
 
 		wp_register_script(
-			'rt-bank-transfer-blocks-js',
+			'bank-transfer-blocks-js',
 			plugin_dir_url(BANK_TRANSFER_PAYMENT_GATEWAY_FILE) . 'assets/js/bank-transfer-blocks.js',
 			['wc-blocks-registry', 'wc-settings', 'wp-element', 'wp-html-entities', 'wp-i18n'],
 			$blocks_js_ver,
 			true
 		);
 
-		return ['rt-bank-transfer-blocks-js'];
+		return ['bank-transfer-blocks-js'];
 	}
 
 	public function get_payment_method_data() {
 		$title       = $this->settings['title'] ?? __('Bank transfer (ACH)', 'bank-transfer-payment-gateway');
 		$description = $this->settings['description'] ?? '';
 
+		$gateways = WC()->payment_gateways ? WC()->payment_gateways->payment_gateways() : [];
+		$gateway  = $gateways[$this->name] ?? null;
+		$amount   = 0.0;
 		if (WC()->cart) {
 			$amount = (float) WC()->cart->get_total('edit');
 			if ($amount < 0.01) {
 				$totals = WC()->cart->get_totals();
 				$amount = (float) ($totals['total'] ?? 0);
 			}
-			$gateways = WC()->payment_gateways ? WC()->payment_gateways->payment_gateways() : [];
-			$gateway  = $gateways[$this->name] ?? null;
-			if ($gateway && method_exists($gateway, 'get_checkout_info_for_amount')) {
-				$info = $gateway->get_checkout_info_for_amount($amount);
-				if (!empty($info['title']))    $title       = $info['title'];
-				if (!empty($info['subtitle'])) $description = $info['subtitle'];
-			}
+		}
+		if ($gateway && method_exists($gateway, 'get_checkout_info_for_amount')) {
+			$info = $gateway->get_checkout_info_for_amount($amount);
+			if (!empty($info['title']))    $title       = $info['title'];
+			if (!empty($info['subtitle'])) $description = $info['subtitle'];
 		}
 
 		$is_active = $this->is_active();

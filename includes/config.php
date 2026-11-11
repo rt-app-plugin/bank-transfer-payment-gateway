@@ -5,7 +5,7 @@ if ( ! defined( 'ABSPATH' ) ) exit; // Exit if accessed directly
 if (!defined('BANK_TRANSFER_PROTOCOL')) {
     define('BANK_TRANSFER_PROTOCOL', 'https://');
 }
-
+ 
 if (!defined('BANK_TRANSFER_HOST')) {
     define('BANK_TRANSFER_HOST', apply_filters('bank_transfer_api_host', 'pay.rt.app'));
 }
@@ -18,6 +18,7 @@ if (!defined('BANK_TRANSFER_API_BASE_URL')) {
 	define('BANK_TRANSFER_API_BASE_URL', BANK_TRANSFER_BASE_URL . '/payment-api');
 }
 
+
 if (!defined('BANK_TRANSFER_PLUGIN_VERSION')) {
     define('BANK_TRANSFER_PLUGIN_VERSION', '1.0.2');
 }
@@ -29,7 +30,7 @@ if (!defined('BANK_TRANSFER_PLUGIN_VERSION')) {
  * both are recognised when reading an order (bank_transfer_is_gateway_order()).
  */
 if (!defined('BANK_TRANSFER_GATEWAY_ID')) {
-	define('BANK_TRANSFER_GATEWAY_ID', 'rt_bank_transfer');
+	define('BANK_TRANSFER_GATEWAY_ID', 'bank_transfer');
 }
 if (!defined('BANK_TRANSFER_LEGACY_GATEWAY_ID')) {
 	define('BANK_TRANSFER_LEGACY_GATEWAY_ID', 'bank_transfer');

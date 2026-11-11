@@ -20,7 +20,7 @@
         return;
     }
 
-    const PAYMENT_METHOD = 'rt_bank_transfer';
+    const PAYMENT_METHOD = 'bank_transfer';
 
     const settings =
         (window.wc?.wcSettings?.getPaymentMethodData?.(PAYMENT_METHOD)) ||
